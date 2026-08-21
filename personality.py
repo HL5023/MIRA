@@ -121,13 +121,10 @@ class Personality:
 
     def _update_mood_from_patience(self):
         # Negative moods from patience override base mood, but also recover.
-        annoyed_thr = self.patience_config.get("annoyed_threshold", 0.35)
-        angry_thr = self.patience_config.get("angry_threshold", 0.0)
-        furious_thr = self.patience_config.get("furious_threshold", -0.4)
+        annoyed_thr = self.patience_config.get("annoyed_threshold", 0.60)
+        angry_thr = self.patience_config.get("angry_threshold", 0.45)
 
-        if self.patience <= furious_thr:
-            self.mood = "angry"
-        elif self.patience <= angry_thr:
+        if self.patience <= angry_thr:
             self.mood = "angry"
         elif self.patience <= annoyed_thr:
             self.mood = "annoyed"

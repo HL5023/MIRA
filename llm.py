@@ -1,9 +1,31 @@
 import json
 import os
 import re
+import time
 import urllib.error
 import urllib.request
 from typing import List
+
+
+PROFANITY = [
+    (re.compile(r"\bf+u+c+k+\b", re.IGNORECASE), "f***"),
+    (re.compile(r"\bb+i+t+c+h+\b", re.IGNORECASE), "b****"),
+    (re.compile(r"\ba+s+s+h+o+l+e+\b", re.IGNORECASE), "a**hole"),
+    (re.compile(r"\bd+i+c+k+h+e+a+d+\b", re.IGNORECASE), "d***head"),
+    (re.compile(r"\bs+h+i+t+\b", re.IGNORECASE), "s***"),
+    (re.compile(r"\bb+a+s+t+a+r+d+\b", re.IGNORECASE), "b*****d"),
+    (re.compile(r"\bd+a+m+n+\b", re.IGNORECASE), "d***"),
+    (re.compile(r"\bd+u+m+b+a+s+s+\b", re.IGNORECASE), "d****ass"),
+    (re.compile(r"\bw+h+o+r+e+\b", re.IGNORECASE), "w****"),
+    (re.compile(r"\bs+l+u+t+\b", re.IGNORECASE), "s***"),
+    (re.compile(r"\bc+u+n+t+\b", re.IGNORECASE), "c***"),
+]
+
+
+def _censor_profanity(text: str) -> str:
+    for pattern, replacement in PROFANITY:
+        text = pattern.sub(replacement, text)
+    return text
 
 
 def load_env_file(path: str = ".env") -> None:
@@ -38,12 +60,28 @@ class LLM:
         self.openai_base_url = os.environ.get("OPENAI_BASE_URL", "https://openapi.coreshub.cn/v1")
         self.openai_api_key = os.environ.get("OPENAI_API_KEY")
 
-    def generate(self, prompt: str = None, messages: list = None) -> str:
+    def generate(self, prompt: str = None, messages: list = None, tools: list = None) -> dict:
+        """Generate a completion.
+
+        Returns a dict: {
+            "content": str,
+            "tool_calls": list or None,
+            "finish_reason": str or None,
+        }
+        """
         if self.provider == "openai":
             if not self.openai_api_key:
                 raise RuntimeError("No OPENAI_API_KEY set")
-            return self._generate_openai(messages)
-        return self._generate_local(prompt)
+            return self._generate_openai(messages, tools)
+        content = self._generate_local(prompt)
+        return {"content": content, "tool_calls": None, "finish_reason": "stop"}
+
+    def generate_text(self, prompt: str = None, messages: list = None) -> str:
+        """Generate a completion and return just the text content."""
+        result = self.generate(prompt=prompt, messages=messages)
+        if isinstance(result, dict):
+            return result.get("content", "")
+        return result
 
     def _generate_local(self, prompt: str) -> str:
         response = self._post_json(
@@ -60,36 +98,62 @@ class LLM:
         )
         return response.get("content", "").strip()
 
-    def _generate_openai(self, messages: list) -> str:
+    def _generate_openai(self, messages: list, tools: list = None) -> dict:
         if messages is None:
             messages = []
         url = f"{self.openai_base_url}/chat/completions"
+        payload = {
+            "model": self.model,
+            "messages": messages,
+        }
+        if tools:
+            payload["tools"] = tools
+            payload["tool_choice"] = "auto"
         response = self._post_json(
             url,
-            {
-                "model": self.model,
-                "messages": messages,
-            },
+            payload,
             headers={"Authorization": f"Bearer {self.openai_api_key}"},
         )
-        return response["choices"][0]["message"]["content"].strip()
+        choice = response["choices"][0]
+        message = choice["message"]
+        content = (message.get("content") or "").strip()
+        tool_calls = []
+        for tc in message.get("tool_calls", []):
+            tool_calls.append({
+                "id": tc["id"],
+                "name": tc["function"]["name"],
+                "arguments": tc["function"]["arguments"],
+            })
+        return {
+            "content": content,
+            "tool_calls": tool_calls or None,
+            "finish_reason": choice.get("finish_reason"),
+        }
 
-    def _post_json(self, url: str, data: dict, headers: dict = None) -> dict:
-        body = json.dumps(data).encode("utf-8")
-        request = urllib.request.Request(
-            url,
-            data=body,
-            headers={"Content-Type": "application/json", **(headers or {})},
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(request, timeout=60) as response:
-                return json.loads(response.read().decode("utf-8"))
-        except urllib.error.HTTPError as e:
-            error_body = e.read().decode("utf-8")
-            raise RuntimeError(f"HTTP {e.code}: {error_body}")
-        except Exception as e:
-            raise RuntimeError(f"Request to {url} failed: {e}")
+    def _post_json(self, url: str, data: dict, headers: dict = None, retries: int = 2) -> dict:
+        for attempt in range(retries + 1):
+            body = json.dumps(data).encode("utf-8")
+            request = urllib.request.Request(
+                url,
+                data=body,
+                headers={"Content-Type": "application/json", **(headers or {})},
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=60) as response:
+                    return json.loads(response.read().decode("utf-8"))
+            except urllib.error.HTTPError as e:
+                error_body = e.read().decode("utf-8")
+                if e.code == 429 and attempt < retries:
+                    wait = 2 ** (attempt + 1)
+                    time.sleep(wait)
+                    continue
+                raise RuntimeError(f"HTTP {e.code}: {error_body}")
+            except Exception as e:
+                if attempt < retries:
+                    time.sleep(1)
+                    continue
+                raise RuntimeError(f"Request to {url} failed: {e}")
 
     def clean_reply(self, text: str) -> str:
         emoji_pattern = re.compile(
@@ -131,6 +195,7 @@ class LLM:
         text = re.sub(r"^(Mira:|Nyx:)\s*", "", text, flags=re.IGNORECASE)
         text = re.sub(r"\*[^*]+\*", "", text)
         text = re.sub(r"\s+", " ", text).strip()
+        text = _censor_profanity(text)
         return text
 
     def _mood_voice(self, mood: str) -> str:
@@ -196,11 +261,23 @@ class LLM:
             "- stay in character always.",
             "- you have a STRONG personality. don't be a pushover.",
             "- if the user insults you, mocks you, or repeats something annoying, react authentically. get annoyed, snap back, or tell them off.",
-            "- when you're angry or annoyed, use sharper language and swear back if it fits. call them names like weirdo, dumbass, stupid, idiot, etc.",
+            "- when you're angry or annoyed, use sharper language and push back. call them names like weirdo, dumbass, stupid, idiot, etc.",
+            "- do NOT output explicit profanity or hard slurs. if you need to swear, censor it like f***, b****, a**hole, d***head, s***.",
             "- don't let the user walk over you. stand your ground.",
             "- your current mood is shown at the top of this prompt. you MUST act like that mood right now, not any previous mood.",
             "- if you don't know something, just say so.",
             "- if context provides the current time, use it when answering time questions. don't say you don't have a clock.",
+            "- You have access to tools. The system will automatically invoke them for you when needed.",
+            "- Available tools: time, write_file, read_file, edit_file, delete_file, list_files, execute_command.",
+            "- Use write_file to create any document, essay, code, outline, etc. Provide a path like 'my_essay.txt'.",
+            "  - Code: use short snake_case filenames with the right extension, e.g. 'hello.py', 'game.js'. No spaces.",
+            "  - Essays/stories/speeches: use short Title Case names, e.g. 'Why Aliens Dont Visit Earth Essay.txt'.",
+            "  - Paths are relative to ~/Desktop/MiraFiles/ unless you give an absolute path.",
+            "- Use read_file to check existing files before editing.",
+            "- Use edit_file to overwrite an existing file with new content.",
+            "- Use execute_command only when the user explicitly asks you to run something.",
+            "- NEVER dump long file content in chat. Always put it in write_file/edit_file.",
+            "- After saving or editing a file, reply briefly with the filename. Do not write the file content in your reply.",
             "",
             "Examples:",
             "user: hi",
@@ -222,7 +299,7 @@ class LLM:
         lines.append("- the user's name is Derek Huang")
         lines.append("- the user calls you Mira")
         if facts:
-            lines.append("\nFACTS YOU KNOW ABOUT THE USER (use them when relevant):")
+            lines.append("\nFACTS YOU KNOW (use them when relevant):")
             lines.extend(f"- {f}" for f in facts[-4:])
 
         if context:
