@@ -35,7 +35,6 @@
     "recover_per_interaction": 0.02,
     "annoyed_threshold": 0.60,
     "angry_threshold": 0.45,
-    "furious_threshold": 0.25,
     "close_terminal_threshold": 0.25
   }
 }
