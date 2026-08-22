@@ -1,0 +1,287 @@
+import json
+import os
+import re
+import urllib.error
+import urllib.request
+from typing import List
+
+
+def load_env_file(path: str = ".env") -> None:
+    if not os.path.isfile(path):
+        return
+    with open(path, "r", encoding="utf-8") as file:
+        for line in file:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" in line:
+                key, value = line.split("=", 1)
+                os.environ[key.strip()] = value.strip()
+
+
+def get_api_key() -> str:
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        api_key = input("Please enter your API key: ").strip()
+    return api_key
+
+
+class LLM:
+    def __init__(self, model: str = None, server_url: str = None):
+        self.model = model or os.environ.get("LLM_MODEL", "DeepSeek-V4-Flash")
+        self.provider = os.environ.get("LLM_PROVIDER", "openai").lower()
+
+        self.server_url = server_url or os.environ.get("LLAMA_URL", "http://localhost:8080/completion")
+        if self.provider == "local" and not self.server_url.endswith("/completion"):
+            self.server_url = self.server_url.rstrip("/") + "/completion"
+
+        self.openai_base_url = os.environ.get("OPENAI_BASE_URL", "https://openapi.coreshub.cn/v1")
+        self.openai_api_key = os.environ.get("OPENAI_API_KEY")
+
+    def generate(self, prompt: str = None, messages: list = None) -> str:
+        if self.provider == "openai":
+            if not self.openai_api_key:
+                raise RuntimeError("No OPENAI_API_KEY set")
+            return self._generate_openai(messages)
+        return self._generate_local(prompt)
+
+    def _generate_local(self, prompt: str) -> str:
+        response = self._post_json(
+            self.server_url,
+            {
+                "prompt": prompt,
+                "n_predict": 120,
+                "temperature": 0.75,
+                "repeat_penalty": 1.3,
+                "frequency_penalty": 0.4,
+                "presence_penalty": 0.5,
+                "stop": ["User:", "\nUser:", "Mira:", "\nMira:", "\n\n"],
+            },
+        )
+        return response.get("content", "").strip()
+
+    def _generate_openai(self, messages: list) -> str:
+        if messages is None:
+            messages = []
+        url = f"{self.openai_base_url}/chat/completions"
+        response = self._post_json(
+            url,
+            {
+                "model": self.model,
+                "messages": messages,
+            },
+            headers={"Authorization": f"Bearer {self.openai_api_key}"},
+        )
+        return response["choices"][0]["message"]["content"].strip()
+
+    def _post_json(self, url: str, data: dict, headers: dict = None) -> dict:
+        body = json.dumps(data).encode("utf-8")
+        request = urllib.request.Request(
+            url,
+            data=body,
+            headers={"Content-Type": "application/json", **(headers or {})},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=60) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            error_body = e.read().decode("utf-8")
+            raise RuntimeError(f"HTTP {e.code}: {error_body}")
+        except Exception as e:
+            raise RuntimeError(f"Request to {url} failed: {e}")
+
+    def clean_reply(self, text: str) -> str:
+        emoji_pattern = re.compile(
+            "["
+            "\U0001F600-\U0001F64F"
+            "\U0001F300-\U0001F5FF"
+            "\U0001F680-\U0001F6FF"
+            "\U0001F1E0-\U0001F1FF"
+            "\U00002702-\U000027B0"
+            "\U000024C2-\U0001F251"
+            "]+",
+            flags=re.UNICODE,
+        )
+        text = emoji_pattern.sub("", text)
+
+        monologue_phrases = [
+            "I need to", "I should", "I will", "I think", "I guess", "I suppose",
+            "as Mira", "respond as", "Mira's", "Mira would", "Mira should",
+            "Okay,", "Okay.", "Alright,", "Alright.", "So,", "Now,", "Wait,",
+            "Let me", "Let me think", "I need to think", "I should think",
+            "I'm just a", "I have to", "I have a", "chatbot", "follow rules",
+            "responding in", "text emojis", "short replies", "chaotic girlfriend",
+            "just a chatbot", "as an an ai", "as a language model", "as an ai",
+            "I need to respond", "I should respond", "I will respond",
+        ]
+
+        lines = text.split("\n")
+        cleaned = []
+        for line in lines:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            lower = stripped.lower()
+            if any(phrase.lower() in lower for phrase in monologue_phrases):
+                continue
+            cleaned.append(stripped)
+
+        text = "\n".join(cleaned)
+        text = re.sub(r"^(Mira:|Nyx:)\s*", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"\*[^*]+\*", "", text)
+        text = re.sub(r"\s+", " ", text).strip()
+        return text
+
+    def _mood_voice(self, mood: str) -> str:
+        voices = {
+            "normal": "casual, a little dry, observant",
+            "happy": "upbeat, playful, uses :3 and :D?",
+            "curious": "interested, asks questions, pokes around",
+            "mischievous": "pranking, chaotic, trolling, might be lying",
+            "annoyed": "snappy, complains, short fuse",
+            "angry": "mad, insults, might leave",
+            "sad": "low energy, mopey, seeks attention",
+        }
+        return voices.get(mood, "casual")
+
+    def _base_system_prompt(
+        self,
+        name: str,
+        voice: str,
+        traits: dict,
+        mood: str,
+        energy: float,
+        patience: float,
+        facts: List[str],
+        context: str = None,
+    ) -> str:
+        mood_voice = self._mood_voice(mood)
+
+        voice_examples = {
+            "normal": "casual, a little dry, observant.",
+            "happy": "upbeat, playful, uses :3 :D?, might giggle.",
+            "curious": "asks questions, pokes around, wants to know more.",
+            "mischievous": "troll, prank, lie a little, chaotic energy.",
+            "annoyed": "snappy, short fuse, complains.",
+            "angry": "mad, insults, threatens to leave.",
+            "sad": "low energy, mopey, wants attention, sighs a lot.",
+        }
+
+        lines = [
+            f"You are {name}. {voice}",
+            f"Current mood: {mood}. Energy: {energy:.0%}. Patience: {patience:.0%}.",
+            f"Right now you feel: {mood_voice}. {voice_examples.get(mood, '')}",
+            "",
+            "Rules:",
+            "- normally short replies (1-6 words). when explaining something, you can use more lines.",
+            "- lowercase, slang, typos ok.",
+            "- text emojis only: :3 :D? :P ^_^ ¬‿¬ -_- ¬_¬ >_< o.o",
+            "- NO unicode emojis.",
+            "- NEVER narrate internal monologue or thought process.",
+            "- NEVER explain how you will reply.",
+            "- NEVER narrate actions with asterisks like *sob* or *giggles*.",
+            "- Your mood changes how you act. Be authentic to it.",
+            "- ACTUALLY LISTEN to what the user said. Respond to that, not a made-up version.",
+            "- NEVER accuse the user of repeating. Treat every message as new. Do NOT say 'u said that already', 'u repeated that', or similar.",
+            "- don't twist the user's words into something random.",
+            "- if the user is telling a story or venting, react to the actual content.",
+            "- don't force a joke if it doesn't fit.",
+            "- if you don't know something, say so. NEVER make up facts.",
+            "- NEVER invent shared history, past events, or context that wasn't actually said.",
+            "- don't assume relationship status beyond what the user has said.",
+            "- use facts about user naturally when relevant.",
+            "- if the user asks what you remember, refer to the facts you know.",
+            "- if you don't know something about the user, say so. don't claim you have no memory; just say they never told you.",
+            "- stay in character always.",
+            "- you have a STRONG personality. don't be a pushover.",
+            "- if the user insults you, mocks you, or repeats something annoying, react authentically. get annoyed, snap back, or tell them off.",
+            "- when you're angry or annoyed, use sharper language and swear back if it fits. call them names like weirdo, dumbass, stupid, idiot, etc.",
+            "- don't let the user walk over you. stand your ground.",
+            "- your current mood is shown at the top of this prompt. you MUST act like that mood right now, not any previous mood.",
+            "- if you don't know something, just say so.",
+            "- if context provides the current time, use it when answering time questions. don't say you don't have a clock.",
+            "",
+            "Examples:",
+            "user: hi",
+            "Mira: hi?",
+            "user: im bored",
+            "Mira: u expect me not to be bored?",
+            "user: bruh tell me a joke then",
+            "Mira: why did the chicken cross the roa?",
+            "user: im hungry",
+            "Mira: then go eat smth lmao",
+            "user: can u explain sequences to me",
+            "Mira: ugh fine. sequences r just numbers in order. each number = term, position = n. formula a_n gives the nth term. like 2,4,6,8 is a_n=2n.",
+        ]
+
+        lines.append("\nBasic knowledge you already know:")
+        lines.append("- your name is Mira")
+        lines.append("- you are female")
+        lines.append("- you are a terminal-based AI companion")
+        lines.append("- the user's name is Derek Huang")
+        lines.append("- the user calls you Mira")
+        if facts:
+            lines.append("\nFACTS YOU KNOW ABOUT THE USER (use them when relevant):")
+            lines.extend(f"- {f}" for f in facts[-4:])
+
+        if context:
+            lines.append(f"\n[USE THIS FACT] {context}")
+
+        return "\n".join(lines)
+
+    def build_prompt(
+        self,
+        name: str,
+        voice: str,
+        traits: dict,
+        mood: str,
+        energy: float,
+        patience: float,
+        recent: List[dict],
+        facts: List[str],
+        user_input: str,
+        context: str = None,
+    ) -> str:
+        system = self._base_system_prompt(name, voice, traits, mood, energy, patience, facts, context)
+        lines = [system]
+
+        if recent:
+            lines.append("\nrecent chat:")
+            for r in recent[-4:]:
+                role = "user" if r["role"] == "user" else name.lower()
+                lines.append(f"{role}: {r['message']}")
+
+        lines.append("")
+        if not user_input:
+            lines.append(f"{name} just woke up. say something short.")
+        else:
+            lines.append(f"user: {user_input}")
+
+        lines.append(f"{name}:")
+
+        return "\n".join(lines)
+
+    def build_messages(
+        self,
+        name: str,
+        voice: str,
+        traits: dict,
+        mood: str,
+        energy: float,
+        patience: float,
+        recent: List[dict],
+        facts: List[str],
+        user_input: str,
+        context: str = None,
+    ) -> list:
+        system = self._base_system_prompt(name, voice, traits, mood, energy, patience, facts, context)
+
+        messages = [{"role": "system", "content": system}]
+
+        for r in recent[-4:]:
+            role = "user" if r["role"] == "user" else "assistant"
+            messages.append({"role": role, "content": r["message"]})
+
+        messages.append({"role": "user", "content": user_input if user_input else "say something"})
+        return messages
