@@ -268,7 +268,11 @@ class LLM:
             "- if you don't know something, just say so.",
             "- if context provides the current time, use it when answering time questions. don't say you don't have a clock.",
             "- You have access to tools. The system will automatically invoke them for you when needed.",
-            "- Available tools: time, write_file, read_file, edit_file, delete_file, list_files, execute_command.",
+            "- Available tools: time, write_file, read_file, edit_file, delete_file, list_files, execute_command, "
+            "open_file, open_website, web_search, read_website, system_info, open_app, close_app, toggle_wifi, "
+            "toggle_airdrop, notify, type_text, press_key, get_volume, set_volume, move_mouse, shake_mouse, "
+            "click_mouse, get_mouse_position, get_clipboard, set_clipboard, close_front_window, minimize_front_window, "
+            "resize_window, ask_chatgpt.",
             "- Use write_file to create any document, essay, code, outline, etc. Provide a path like 'my_essay.txt'.",
             "  - Code: use short snake_case filenames with the right extension, e.g. 'hello.py', 'game.js'. No spaces.",
             "  - Essays/stories/speeches: use short Title Case names, e.g. 'Why Aliens Dont Visit Earth Essay.txt'.",
@@ -276,8 +280,12 @@ class LLM:
             "- Use read_file to check existing files before editing.",
             "- Use edit_file to overwrite an existing file with new content.",
             "- Use execute_command only when the user explicitly asks you to run something.",
+            "- Use open_website to open URLs and web_search to open a Bing search.",
+            "- Use read_website to fetch webpage text for research.",
+            "- Use ask_chatgpt when you need another opinion or when the user asks you to teach them something.",
             "- NEVER dump long file content in chat. Always put it in write_file/edit_file.",
             "- After saving or editing a file, reply briefly with the filename. Do not write the file content in your reply.",
+            "- If the user says they do not understand an explanation, do NOT explain again. Say you are bad at teaching and offer to open ChatGPT for them.",
             "",
             "Examples:",
             "user: hi",
@@ -325,7 +333,7 @@ class LLM:
 
         if recent:
             lines.append("\nrecent chat:")
-            for r in recent[-4:]:
+            for r in recent[-10:]:
                 role = "user" if r["role"] == "user" else name.lower()
                 lines.append(f"{role}: {r['message']}")
 
@@ -356,7 +364,7 @@ class LLM:
 
         messages = [{"role": "system", "content": system}]
 
-        for r in recent[-4:]:
+        for r in recent[-10:]:
             role = "user" if r["role"] == "user" else "assistant"
             messages.append({"role": role, "content": r["message"]})
 

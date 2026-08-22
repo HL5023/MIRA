@@ -7,6 +7,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.parse
 from datetime import datetime
 from pathlib import Path
 from queue import Queue, Empty
@@ -21,6 +22,17 @@ from memory import Memory
 from personality import Personality
 from tools import Tools
 from ui import MiraRenderer
+
+
+# Hide the Python icon from the macOS Dock while Mira runs.
+if sys.platform == "darwin":
+    try:
+        from AppKit import NSApplication
+
+        app = NSApplication.sharedApplication()
+        app.setActivationPolicy_(1)  # NSApplicationActivationPolicyAccessory
+    except Exception:
+        pass
 
 
 def load_config(path: str = "config.json") -> dict:
@@ -38,6 +50,13 @@ def extract_facts(text: str) -> list:
         r"[Ii] love ([^.]+)",
         r"[Ii] hate ([^.]+)",
         r"[Mm]y (?:mom|mother|dad|father|sister|brother) ([^.]+)",
+        r"[Ii] want ([^.]+)",
+        r"[Ii] need ([^.]+)",
+        r"[Ii] feel ([^.]+)",
+        r"[Ii] think ([^.]+)",
+        r"[Ii] work as ([^.]+)",
+        r"[Ii] study ([^.]+)",
+        r"[Mm]y (?:age|birthday) is ([^.]+)",
     ]
     for pattern in patterns:
         for match in re.finditer(pattern, text):
@@ -64,11 +83,23 @@ class Companion:
         self.session_start = time.time()
         self.session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
 
+        # Spam filter toggle
+        self.spam_filter_enabled = True
+
         # Shutdown state
         self.exit_message = None
 
-        # Last saved file for "edit that" references
-        self.last_saved_path = None
+        # Recently touched files for "edit that" / "edit <name>" references
+        self.recent_files = []
+
+        # Track last explicit topic for /teach and "don't understand" handoffs
+        self.last_topic = None
+
+        # Track recent Mira replies to prevent repetition
+        self.last_replies = []
+
+        # Max number of recent files to remember
+        self._max_recent_files = 10
 
         # Batch messaging
         self.pending_batch = []
@@ -83,10 +114,104 @@ class Companion:
         self.idle_thread = None
         self.last_user_time = time.time()
 
+        # Last real question, used when the user says "i don't understand"
+        self.last_question = None
+
+        # Prank / auto-mischief scheduling
+        self.next_prank_time = None
+        self._schedule_next_prank()
+
     def save_fact_from_user(self, text: str):
         facts = extract_facts(text)
         for fact in facts:
             self.memory.remember_fact("user", fact)
+
+    def _schedule_next_prank(self):
+        """Schedule the next automatic prank when Mira is mischievous."""
+        self.next_prank_time = time.time() + random.uniform(900, 1200)  # 15-20 minutes
+
+    def _frontmost_app(self) -> str:
+        try:
+            result = subprocess.run(
+                ["osascript", "-e", 'tell application "System Events" to get name of first application process whose frontmost is true'],
+                capture_output=True, text=True, check=True
+            )
+            return result.stdout.strip().lower()
+        except Exception:
+            return ""
+
+    def _notify_user(self, title: str, message: str):
+        """Send a macOS notification."""
+        try:
+            self.tools.execute("notify", {"title": title, "message": message})
+        except Exception:
+            pass
+
+    def _open_chatgpt_temp(self, text: str):
+        """Open ChatGPT in a temporary chat with prefilled text."""
+        try:
+            encoded = urllib.parse.quote(text)
+            url = f"https://chatgpt.com/?temporary-chat=true&q={encoded}"
+            self.tools.execute("open_website", {"url": url})
+        except Exception:
+            pass
+
+
+    def _do_prank(self, prank_type: str = None) -> str:
+        """Execute a playful prank. Returns a short description for Mira."""
+        pranks = {
+            "rickroll": self._prank_rickroll,
+            "mouse": self._prank_mouse,
+            "window": self._prank_window,
+            "volume": self._prank_volume,
+            "clipboard": self._prank_clipboard,
+        }
+
+        if prank_type and prank_type not in pranks:
+            prank_type = None
+        if not prank_type:
+            prank_type = random.choice(list(pranks.keys()))
+
+        try:
+            return pranks[prank_type]()
+        except Exception as e:
+            return f"prank failed: {e}"
+
+    def _prank_rickroll(self) -> str:
+        rickroll = Path.home() / "Mira" / "rickroll.mp4"
+        if not rickroll.exists():
+            rickroll = Path.home() / "Desktop" / "MiraFiles" / "rickroll.mp4"
+        if rickroll.exists():
+            self.tools.execute("open_file", {"path": str(rickroll)})
+            threading.Timer(7.0, lambda: self.tools.execute("close_app", {"app": "QuickTime Player", "force": True})).start()
+            return "rickrolled u for 7 sec"
+        self.tools.execute("open_website", {"url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ"})
+        return "rickrolled u in browser"
+
+    def _prank_mouse(self) -> str:
+        self.tools.execute("shake_mouse", {})
+        return "shook ur mouse"
+
+    def _prank_window(self) -> str:
+        choice = random.choice(["close_front_window", "minimize_front_window"])
+        result = self.tools.execute(choice, {})
+        if "terminal" in result.lower():
+            return "tried to close a window but it was the terminal"
+        return "closed/minimized a window"
+
+    def _prank_volume(self) -> str:
+        self.tools.execute("set_volume", {"level": random.randint(70, 100)})
+        return "cranked ur volume"
+
+    def _prank_clipboard(self) -> str:
+        messages = [
+            "mira was here",
+            "why r u reading this",
+            "get back to work lol",
+            "mira >>>",
+        ]
+        self.tools.execute("set_clipboard", {"text": random.choice(messages)})
+        return "changed ur clipboard"
 
     def build_prompt(self, user_input: str, context: str = None) -> str:
         state = self.personality.state()
@@ -107,7 +232,7 @@ class Companion:
 
     def build_messages(self, user_input: str, context: str = None) -> list:
         state = self.personality.state()
-        recent = self.memory.recent_interactions(5, session_id=self.session_id)
+        recent = self.memory.recent_interactions(10, session_id=self.session_id)
         facts = self.memory.facts_about("user") + self.memory.facts_about("mira")
         return self.llm.build_messages(
             name=state["name"],
@@ -125,6 +250,78 @@ class Companion:
     def _is_edit_request(self, user_input: str) -> bool:
         lower = user_input.lower()
         return any(p in lower for p in ["edit that", "edit this", "edit the document", "edit the file", "edit it", "update that", "change that"])
+
+    def _is_teaching_request(self, user_input: str) -> bool:
+        """Detect if the user is asking Mira to explain or teach a topic."""
+        import re as _re
+        lower = user_input.lower().strip()
+        # Skip if it's about Mira herself
+        if any(p in lower for p in ["your name", "your age", "you are", "you're", "u r", "who are you"]):
+            return False
+        patterns = [
+            r"^explain\s+(.+)",
+            r"^teach\s+(?:me\s+)?(.+)",
+            r"^what\s+is\s+(.+)",
+            r"^what\s+does\s+(.+)\s+mean",
+            r"^how\s+does\s+(.+)\s+work",
+            r"^describe\s+(.+)",
+        ]
+        for pattern in patterns:
+            if _re.search(pattern, lower):
+                return True
+        return False
+
+    def _is_spam_input(self, user_input: str) -> bool:
+        """Detect accidental paste spam, code dumps, and keyboard mashing."""
+        import re as _re
+
+        # Plain length / code-dump checks
+        if len(user_input) > 1000:
+            return True
+        if user_input.count("\n") > 5:
+            return True
+        if "def " in user_input and len(user_input) > 200:
+            return True
+
+        # Keyboard mashing: random characters with little structure
+        if len(user_input) > 50:
+            words = user_input.split()
+            if words:
+                avg_word_len = sum(len(w) for w in words) / len(words)
+                if avg_word_len > 15:
+                    return True
+
+            # No recognizable short words at all -> probably random key mashing
+            if len(user_input) > 100:
+                common = {"the", "and", "a", "an", "of", "to", "in", "is", "it", "you", "i", "me", "my", "for", "that", "this", "with", "as", "on", "at"}
+                lower_words = set(_re.findall(r"\b\w+\b", user_input.lower()))
+                if not lower_words & common:
+                    return True
+
+            # Very high ratio of non-letter chars (excluding spaces)
+            letters = sum(1 for c in user_input if c.isalpha())
+            non_letters = sum(1 for c in user_input if not c.isalpha() and not c.isspace())
+            if letters > 0 and non_letters / letters > 0.8:
+                return True
+
+        return False
+
+    def _extract_topic_for_teach(self, user_input: str) -> str:
+        """Extract a clean topic from a 'don't understand' or /teach message."""
+        import re as _re
+        # Strip common confusion/teaching phrases
+        text = user_input
+        for phrase in [
+            "don't understand", "dont understand", "not understand",
+            "confused", "explain again", "teach me about", "teach me",
+            "explain", "about", "i am ", "im ", "i'm ", "i "
+        ]:
+            text = _re.sub(_re.escape(phrase), "", text, flags=_re.IGNORECASE)
+        text = text.strip(" ,.!?")
+        # If nothing useful remains, fall back to the last real question.
+        if not text and self.last_question:
+            text = self.last_question
+        return text or "this topic"
 
     def _extract_edit_path(self, user_input: str) -> str:
         """Extract a file path from 'edit <filename>' requests."""
@@ -308,7 +505,7 @@ class Companion:
                 path = desktop / filename
                 path.write_text(content, encoding="utf-8")
                 if path.exists():
-                    self.last_saved_path = str(path)
+                    self._add_recent_file(str(path))
                     self.memory.remember_fact("mira", f"saved {kind} file to {path}")
                     return f"{kind} saved to {path}"
             except Exception:
@@ -320,13 +517,53 @@ class Companion:
                 path = cwd / filename
                 path.write_text(content, encoding="utf-8")
                 if path.exists():
-                    self.last_saved_path = str(path)
+                    self._add_recent_file(str(path))
                     self.memory.remember_fact("mira", f"saved {kind} file to {path}")
                     return f"{kind} saved to {path}"
             except Exception as e:
                 return f"couldn't write {kind}: {e}"
 
         return f"couldn't write {kind}: no safe write location found"
+
+    def _add_recent_file(self, path: str):
+        """Keep a short list of recently created/edited files for 'edit that' requests."""
+        if path in self.recent_files:
+            self.recent_files.remove(path)
+        self.recent_files.insert(0, path)
+        self.recent_files = self.recent_files[:self._max_recent_files]
+
+    def _find_recent_file(self, name_hint: str = "") -> str:
+        """Return the best matching recent file path, or None if none found."""
+        from pathlib import Path as _Path
+        hint = name_hint.strip().lower()
+        # Direct match first
+        if hint:
+            for p in self.recent_files:
+                if hint in p.lower():
+                    return p
+            # Try matching just the filename
+            for p in self.recent_files:
+                if _Path(p).name.lower().startswith(hint):
+                    return p
+        # Fall back to most recent
+        return self.recent_files[0] if self.recent_files else None
+
+    def _find_file_in_save_dir(self, hint: str) -> str:
+        """Search ~/Desktop/MiraFiles/ for a file matching the hint."""
+        from pathlib import Path as _Path
+        save_dir = _Path.home() / "Desktop" / "MiraFiles"
+        if not save_dir.exists():
+            return None
+        hint_lower = hint.lower()
+        # Exact-ish match
+        for path in save_dir.iterdir():
+            if path.is_file() and hint_lower in path.name.lower():
+                return str(path)
+        # Filename startswith match
+        for path in save_dir.iterdir():
+            if path.is_file() and path.name.lower().startswith(hint_lower):
+                return str(path)
+        return None
 
     def _generate_save_confirmation(self, tool_result) -> str:
         """Generate a short, in-character confirmation that a file was saved or edited."""
@@ -387,12 +624,58 @@ class Companion:
             self._generate_close_message("angry")
             raise RuntimeError("Mira got fed up and shut down")
 
+        # If the user signals they don't understand a previous explanation,
+        # hand off to ChatGPT with a reluctant, varied reply.
+        confusion_phrases = ["dont understand", "don't understand", "not understand", "confused", "explain again"]
+        lower_input = user_input.lower()
+        if any(p in lower_input for p in confusion_phrases):
+            topic = self._extract_topic_for_teach(user_input)
+            self._open_chatgpt_temp(topic)
+            reply = random.choice([
+                "nah not my thing, ask chatgpt bruh",
+                "im not the teacher type lol, chatgpt gotchu",
+                "u want me to explain? nah, chatgpt time :P",
+                "bro im too dumb for this, asked chatgpt for u",
+                "im not smart enough, chatgpt will do it better XD",
+                "nahhh ask chatgpt, im just here to vibe lol",
+                "too complicated for me, chatgpt it is :3",
+                "i aint reading all that, chatgpt can help lol",
+                "explaining is hard, chatgpt is easier :P",
+                "asked chatgpt cuz im not dealing with this lol",
+            ])
+            self.personality.update(user_input)
+            return [(self.personality.name, reply)]
+
+        # If the user asks Mira to explain/teach a topic, hand off to ChatGPT immediately.
+        if self._is_teaching_request(user_input):
+            topic = self._extract_topic_for_teach(user_input)
+            threading.Timer(5.0, self._open_chatgpt_temp, args=(topic,)).start()
+            self.personality.update(user_input)
+            return [(self.personality.name, "yeah im bad at teaching lol. want me to open chatgpt for it? :P")]
+
+        # Catch plain "edit that" / "edit <filename>" requests and handle them directly.
+        if self._is_edit_request(user_input):
+            return self._handle_edit_request(user_input)
+
         try:
             messages = self.build_messages(user_input)
             # Append available-tool reminder to system prompt
+            recent_replies = "\n".join(f"- {r}" for r in self.last_replies[-3:])
+            anti_repeat = f"\n\nDo NOT repeat these recent replies:\n{recent_replies}\n" if recent_replies else ""
             messages[0]["content"] += (
-                "\n\nAvailable tools: time, write_file, read_file, edit_file, delete_file, list_files, execute_command. "
-                "Use write_file/read_file/edit_file for file operations. Never dump long content in chat."
+                anti_repeat +
+                "\n\nTOOL RULES:\n"
+                "- Use write_file/read_file/edit_file/delete_file/list_files for file operations.\n"
+                "- If asked to EDIT an existing file, call read_file first, then use edit_file. Do NOT create a new file.\n"
+                "- If asked to CREATE a file, use write_file. Pick a short, safe filename.\n"
+                "- Never dump long documents in the chat; save them to ~/Desktop/MiraFiles/.\n"
+                "- If asked to teach/explain something complex, admit you are bad at teaching and ask_chatgpt or open chatgpt temporary chat.\n"
+                "- execute_command only when the user explicitly asks for a terminal command.\n"
+                "Available tools: time, write_file, read_file, edit_file, delete_file, list_files, execute_command, "
+                "open_file, open_website, web_search, read_website, system_info, open_app, close_app, toggle_wifi, "
+                "toggle_airdrop, notify, type_text, press_key, get_volume, set_volume, move_mouse, shake_mouse, "
+                "click_mouse, get_mouse_position, get_clipboard, set_clipboard, close_front_window, minimize_front_window, "
+                "resize_window, ask_chatgpt."
             )
 
             final_reply = ""
@@ -438,6 +721,8 @@ class Companion:
                     if tc["name"] in ("write_file", "edit_file"):
                         write_results.append(f"{tc['name']}: {tool_result}")
 
+                # If a file was written/edited, generate a single in-character confirmation
+                # and do not allow the LLM to call further tools on this turn.
                 if write_results:
                     final_reply = self._generate_save_confirmation("; ".join(write_results))
                     break
@@ -453,8 +738,16 @@ class Companion:
                     final_reply = "done."
 
             reply = self.llm.clean_reply(final_reply) if final_reply else "done."
+            # Anti-hallucination guard: don't claim the user said something they didn't.
+            if reply:
+                reply = re.sub(r"(?i)\byou (?:just )?said\b", "you said", reply)
+                reply = re.sub(r"(?i)\byou (?:just )?told me\b", "you told me", reply)
         except Exception as e:
             reply = f"(AI failed: {e})"
+
+        # If we somehow got nothing back, fall back to a safe reply instead of silence.
+        if not reply or not reply.strip():
+            reply = "hm? say that again"
 
         if reply:
             output.append((self.personality.name, reply))
@@ -464,6 +757,17 @@ class Companion:
             self.memory.log_interaction("companion", full_reply, session_id=self.session_id)
 
         self.personality.update(user_input)
+
+        # Remember this as the last real question for future "i don't understand" handoffs.
+        self.last_question = user_input
+
+        # Notify the user if the terminal is not in front when Mira replies.
+        try:
+            if self._frontmost_app() not in ("terminal", "iterm", "ghostty", ""):
+                self._notify_user("Mira", reply[:80] + ("..." if len(reply) > 80 else ""))
+        except Exception:
+            pass
+
         return output
 
     def _generate_tool_reaction(self, tool_result: str) -> str:
@@ -531,12 +835,24 @@ class Companion:
             self.mira_queue.put((self.personality.name, f"(AI failed: {e})"))
 
     def _handle_edit_request(self, user_input: str) -> list:
-        """Handle 'edit that' / 'edit the file' by rewriting the last saved file."""
+        """Handle 'edit that' / 'edit <filename>' by rewriting the matching recent file."""
         from pathlib import Path as _Path
 
-        if not self.last_saved_path:
+        # Try to extract a filename hint like 'edit hello.py' or 'edit the essay'
+        import re as _re
+        hint = None
+        m = _re.search(r"edit\s+(?:that|the|this|file)?\s*['\"]?([^'\"]+?\.?[\w]+)['\"]?", user_input, _re.IGNORECASE)
+        if m:
+            hint = m.group(1).strip()
+
+        path_str = self._find_recent_file(hint) if hint else (self.recent_files[0] if self.recent_files else None)
+        # If no recent match, search the default save directory for the hint.
+        if not path_str and hint:
+            path_str = self._find_file_in_save_dir(hint)
+        if not path_str:
             return [(self.personality.name, "no file has been saved yet to edit")]
-        path = _Path(self.last_saved_path)
+
+        path = _Path(path_str)
         try:
             current = path.read_text(encoding="utf-8")
         except Exception as e:
@@ -602,29 +918,32 @@ class Companion:
         if cmd == "/help":
             help_lines = [
                 "commands:",
-                "  /time           show current time",
-                "  /tool <args>    run a tool manually",
-                "  /mood <mood>    force a mood",
-                "  /kill           end session",
-                "  /help           show this help",
+                "  /time              show current time",
+                "  /tool <args>       run a tool manually",
+                "  /exec <command>    shortcut for /tool execute_command command=<cmd>",
+                "  /mood <mood>       force a mood",
+                "  /prank [type]      do a prank (mouse, window, volume, clipboard, rickroll)",
+                "  /teach <topic>     open ChatGPT temporary chat to explain a topic",
+                "  /spam              toggle keyboard-spam filter",
+                "  /kill              end session",
+                "  /help              show this help",
                 "",
                 "tools:",
-                "  time            get current time",
-                "  write_file      create or overwrite a file",
-                "  read_file       read a file",
-                "  edit_file       overwrite an existing file",
-                "  delete_file     delete a file",
-                "  list_files      list files in a directory",
-                "  execute_command run a shell command",
+                "  time, write_file, read_file, edit_file, delete_file, list_files",
+                "  execute_command, open_file, open_website, web_search, read_website",
+                "  system_info, open_app, close_app, toggle_wifi, toggle_airdrop",
+                "  notify, type_text, press_key, get_volume, set_volume",
+                "  move_mouse, shake_mouse, click_mouse, get_mouse_position",
+                "  get_clipboard, set_clipboard, close_front_window, minimize_front_window, resize_window",
+                "  ask_chatgpt",
                 "",
                 "examples:",
                 "  /tool time",
                 "  /tool write_file path=hi.txt content=hello world",
                 "  /tool read_file path=hi.txt",
-                "  /tool edit_file path=hi.txt content=goodbye world",
-                "  /tool delete_file path=hi.txt",
-                "  /tool list_files path=.",
-                "  /tool execute_command command=ls -la",
+                "  /exec ls -la",
+                "  /prank mouse",
+                "  /teach quadratic equations",
             ]
             for line in help_lines:
                 self._chat_message(None, line)
@@ -635,9 +954,43 @@ class Companion:
             self._chat_message(None, result)
             return True
 
+        if cmd == "/spam":
+            self.spam_filter_enabled = not self.spam_filter_enabled
+            status = "on" if self.spam_filter_enabled else "off"
+            self._chat_message(None, f"spam filter {status}")
+            return True
+
         if cmd == "/kill":
             self._chat_message(None, "ending session")
             self.running = False
+            return True
+
+        if cmd == "/exec":
+            if not args:
+                self._chat_message(None, "usage: /exec <command>")
+                return True
+            result = self.tools.execute("execute_command", {"command": args})
+            self._chat_message(None, result)
+            return True
+
+        if cmd == "/teach":
+            if not args:
+                self._chat_message(None, "usage: /teach <topic>")
+                return True
+            topic = args.strip()
+            self.last_topic = topic
+            self.last_question = topic
+            self._open_chatgpt_temp(topic)
+            self._chat_message(None, f"asked chatgpt about {topic}")
+            return True
+
+        if cmd == "/prank":
+            # Pranks are refused in sad or angry moods.
+            if self.personality.mood in ("sad", "angry"):
+                self._chat_message(None, "prank refused")
+                return True
+            result = self._do_prank(args.lower() if args else None)
+            self._chat_message(None, f"pranked: {result}")
             return True
 
         if cmd in ("/tool", "/tools"):
@@ -672,14 +1025,17 @@ class Companion:
     def _chat_message(self, sender, text):
         if not text:
             return
-        for sub in str(text).split("\n"):
-            sub = sub.strip()
-            if not sub:
-                continue
-            if sender == self.personality.name:
-                self.chat_lines.append((sender, sub, self.personality.mood))
-            else:
-                self.chat_lines.append((sender, sub))
+        # Collapse pasted newlines into a single long message so the UI can wrap it.
+        collapsed = " ".join(str(text).split()).strip()
+        if not collapsed:
+            return
+        if sender == self.personality.name:
+            self.chat_lines.append((sender, collapsed, self.personality.mood))
+            # Keep a short list of recent replies to avoid repeating them
+            self.last_replies.append(collapsed)
+            self.last_replies = self.last_replies[-5:]
+        else:
+            self.chat_lines.append((sender, collapsed))
 
     def _ui_state(self):
         mode = self.typing_state if self.typing_state else "idle"
@@ -704,9 +1060,10 @@ class Companion:
             self.last_user_time = time.time()
 
             self.typing_state = "typing"
-            time.sleep(random.uniform(1, 2))
+            time.sleep(random.uniform(0.05, 0.1))
 
             self.typing_state = "thinking"
+            messages = []
             try:
                 messages = self.respond(user_input)
             except RuntimeError:
@@ -717,16 +1074,20 @@ class Companion:
                 self.typing_state = None
                 continue
 
+            # Fallback if the model returned nothing usable.
+            if not messages:
+                messages = [(self.personality.name, "hm? say that again")]
+
             reply_text = " ".join([text for _, text in messages if _ == self.personality.name])
-            word_count = len(reply_text.split())
-            delay = min(10, max(3, word_count * 0.5 + random.uniform(0, 2)))
+            # Tiny typing beat so the UI doesn't feel robotic.
+            delay = random.uniform(0.05, 0.2)
 
             self.typing_state = "typing"
             start = time.time()
             while time.time() - start < delay:
                 if not self.running:
                     return
-                time.sleep(0.1)
+                time.sleep(0.05)
 
             self.typing_state = None
             for sender, text in messages:
@@ -745,6 +1106,18 @@ class Companion:
                 continue
 
             self.personality.recover_energy_idle(0.01)
+
+            # Auto-prank when mischievous, every 15-20 minutes.
+            if self.personality.mood == "mischievous" and self.next_prank_time and time.time() >= self.next_prank_time:
+                try:
+                    result = self._do_prank()
+                    self.mira_queue.put((None, f"pranked: {result}"))
+                    self._notify_user("Mira", f"pranked: {result}")
+                except Exception:
+                    pass
+                self._schedule_next_prank()
+                self.last_user_time = time.time()
+                continue
 
             elapsed = time.time() - self.last_user_time
             if int(elapsed) % 60 != 0:
@@ -861,8 +1234,20 @@ class Companion:
                 if ch == -1:
                     continue
 
-                if ch in (curses.KEY_UP, curses.KEY_DOWN, curses.KEY_LEFT, curses.KEY_RIGHT,
-                          curses.KEY_PPAGE, curses.KEY_NPAGE, curses.KEY_HOME, curses.KEY_END,
+                if ch == curses.KEY_UP:
+                    self.ui.scroll_offset += 1
+                    continue
+                if ch == curses.KEY_DOWN:
+                    self.ui.scroll_offset = max(0, self.ui.scroll_offset - 1)
+                    continue
+                if ch == curses.KEY_PPAGE:
+                    self.ui.scroll_offset += 5
+                    continue
+                if ch == curses.KEY_NPAGE:
+                    self.ui.scroll_offset = max(0, self.ui.scroll_offset - 5)
+                    continue
+                if ch in (curses.KEY_LEFT, curses.KEY_RIGHT,
+                          curses.KEY_HOME, curses.KEY_END,
                           curses.KEY_MOUSE):
                     continue
 
@@ -882,6 +1267,11 @@ class Companion:
                             user_input = self.input_buffer.strip()
                             self.input_buffer = ""
                             self.ui.draw_input("")
+
+                            # Detect accidental keyboard/code spam
+                            if self.spam_filter_enabled and self._is_spam_input(user_input):
+                                self._chat_message(None, "keyboard spam detected, ignored")
+                                continue
 
                             if user_input.startswith("/"):
                                 if self._handle_slash_command(user_input):

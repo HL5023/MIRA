@@ -47,38 +47,40 @@ python3 main.py
 
 ## What You See
 
-Mira lives in the center of the terminal as a small animated kaomoji face. Her face changes with her mood, and tiny particles float around her.
+Mira's current mood is shown in the **bottom status bar**, along with energy, patience, session duration, and the current time.
 
 At the bottom of the screen you will see a status bar like this:
 
 ```
-Energy 100%     Patience 100%     0m12s     11:30
+Happy | Energy 100% | Patience 100% | 0m12s | 11:30
 ```
 
 | Part | Meaning |
 |------|---------|
+| Mood | How Mira currently feels |
 | Energy | How tired she is |
 | Patience | How done with your behavior she is |
 | Duration | How long the current session has been open |
 | Time | Current system time |
 
-When Mira is typing you will see `MIRA IS TYPING` under her face.
-
 ---
 
-## Features in v26.2.1
+## Features in v26.2.2
 
 - **Terminal chat** — Talk to Mira inside a curses terminal UI.
-- **Animated Mira face** — One-line kaomoji face with mood-based animations and tiny particles.
 - **Personality** — Casual, sometimes snarky, sometimes caring. Short replies, slang, text emojis.
 - **Moods** — normal, happy, curious, mischievous, annoyed, angry, sad.
 - **Energy & Patience** — Mira gets tired and annoyed over time. Insults drain patience; idle time recovers energy.
 - **Memory** — Remembers facts you tell her across sessions.
 - **Tool loop** — Mira can call tools through function calling and react to the results.
-- **Slash commands** — `/time`, `/tool`, `/mood`, `/kill`, `/help`.
+- **Slash commands** — `/time`, `/tool`, `/exec`, `/mood`, `/prank`, `/teach`, `/kill`, `/help`.
 - **File tools** — Mira can write, read, edit, delete, and list files in `~/Desktop/MiraFiles/`.
+- **Mac control tools** — mouse/keyboard control, volume, notifications, app/window management, clipboard, WiFi/AirDrop toggles.
+- **Research tools** — open websites, search Bing, fetch webpage text, ask ChatGPT.
+- **Pranks** — `/prank` or automatic mischief every 15-20 minutes while mischievous.
+- **Teach mode** — `/teach <topic>` gives a 1-2 sentence explanation in the terminal and offers to open ChatGPT for a clearer answer.
 - **Time check** — She can tell you the current time.
-- **Shutdown** — Pushes her too far and she will close the session.
+- **Shutdown** — Pushing her too far will close the session.
 
 ### Available Tools
 
@@ -92,15 +94,16 @@ When Mira is typing you will see `MIRA IS TYPING` under her face.
 | `list_files` | List files in a directory | `/tool list_files path=.` |
 | `execute_command` | Run a shell command (only when you ask for it) | `/tool execute_command command="python3 hello.py"` |
 
-`/tool` (or `/tools`) can also be used with the pipe format: `/tool write_file:path=hello.txt|content=hi`.
+`/tool` (or `/tools`) can also be used with the pipe format: `/tool write_file:path=hi.txt|content=hi`.
 
-All other tools have been removed for now so we can focus on making the writing tools solid.
+`/exec <command>` is a shortcut for `/tool execute_command command=<command>`.
 
+Tools include: `time, write_file, read_file, edit_file, delete_file, list_files, execute_command, open_file, open_website, web_search, read_website, system_info, open_app, close_app, toggle_wifi, toggle_airdrop, notify, type_text, press_key, get_volume, set_volume, move_mouse, shake_mouse, click_mouse, get_mouse_position, get_clipboard, set_clipboard, close_front_window, minimize_front_window, resize_window, ask_chatgpt.`
 ---
 
 ## How Moods Work
 
-Mira’s mood comes from her **stats**.
+Mira's mood comes from her **stats**.
 
 ### Patience
 
@@ -156,20 +159,34 @@ MIRA/
 
 ---
 
-## Known Bugs in v26.2.1
+## What Changed in v26.2.2
 
-- **Screen glitches on force-close** — when Mira shuts down the session, curses can leave escape-sequence garbage behind.
+Major feature update: tool system, macOS control, research, pranks, and UI overhaul.
+
+- **Tool loop** — Mira can call tools via function calling and react to the results.
+- **File tools** — `write_file`, `read_file`, `edit_file`, `delete_file`, and `list_files`.
+- **Execute command tool** — run shell commands when explicitly asked.
+- **Mac control tools** — mouse/keyboard control, volume, notifications, app/window management, clipboard, WiFi/AirDrop toggles.
+- **Research tools** — open websites, web search, fetch webpage text, and ask ChatGPT.
+- **Slash commands** — `/time`, `/tool`, `/exec`, `/mood`, `/prank`, `/teach`, `/kill`, `/help`.
+- **Pranks** — `/prank` command and automatic mischief every 15–20 minutes while mischievous.
+- **Teach mode** — `/teach <topic>` gives a brief explanation and offers to open ChatGPT for a clearer answer.
+- **UI overhaul** — removed the face animation and replaced it with a simple mood label in the status bar.
+- **Recent files list** — "edit that" / "edit <filename>" now finds the right file.
+- **Faster replies** — reduced artificial typing delays so Mira feels snappier.
+- - **Mischievous pranks** — auto-pranks only fire while mood is `mischievous`.
+- **Auto-prank interval** — 15–20 minutes.
+
+## Known Bugs in v26.2.2
+
 - **Very small terminals** — resizing the terminal to an extremely small size can break the layout.
 - **Long replies from AI** — Mira may still ignore the "keep it short" rule and ramble.
-- **Inappropriate content errors** — some providers may reject prompts or outputs that contain strong language.
-- **Slash commands are still rough** — `/tool` argument parsing is simple and may choke on complex quoted values.
-- **File save confirmations** — Mira sometimes replies with raw tool output instead of an in-character confirmation.
 
 ---
 
 ## Notes
 
-- v26.2.1 adds tools, but they are still experimental.
+- V26.2.2 is a feature update on top of V26.2.1.
 - Mira boots up in `normal` mood with full energy and patience.
 - The `.env` file and `memory/` folder are ignored by Git so your API key and chat data stay private.
 - Mira is still under development.
