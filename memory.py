@@ -12,7 +12,9 @@ class Memory:
         self.state_path = self.memory_dir / "state.json"
         self.log_path = self.memory_dir / "interactions.jsonl"
         self.facts_path = self.memory_dir / "facts.jsonl"
+        self.events_path = self.memory_dir / "events.jsonl"
         self.short_term_path = self.memory_dir / "short_term.json"
+        self.moods_path = self.memory_dir / "moods.jsonl"
 
     # ── Persistent state ───────────────────────────────────────────────
 
@@ -41,6 +43,36 @@ class Memory:
             entry["session_id"] = session_id
         with self.log_path.open("a") as f:
             f.write(json.dumps(entry) + "\n")
+
+    def summarize_session(self, session_id, llm):
+        """Return a concise summary of the current session."""
+        interactions = self.recent_interactions(20, session_id)
+        facts = self.all_facts()[-10:]
+        events = self.recent_events(10)
+        if not interactions and not facts and not events:
+            return "nothing to summarize yet."
+        parts = [
+            "Summarize this session briefly from Mira's perspective.",
+            "",
+            f"Recent interactions ({len(interactions)}):",
+        ]
+        for i in interactions:
+            parts.append(f"- {i['role']}: {i['message'][:80]}")
+        parts.append("")
+        parts.append(f"Facts ({len(facts)}):")
+        for f in facts:
+            parts.append(f"- {f}")
+        parts.append("")
+        parts.append(f"Events ({len(events)}):")
+        for e in events:
+            parts.append(f"- {e.get('event_type')}: {e.get('detail')}")
+        prompt = "\n".join(parts)
+        if llm is not None:
+            try:
+                return llm.generate_text(prompt=prompt)
+            except Exception as exc:
+                return f"error summarizing session: {exc}"
+        return prompt
 
     def recent_interactions(self, n: int = 20, session_id: str = None) -> List[Dict]:
         if not self.log_path.exists():
@@ -78,7 +110,66 @@ class Memory:
     def all_facts(self) -> List[str]:
         if not self.facts_path.exists():
             return []
-        return [json.loads(line)["fact"] for line in self.facts_path.read_text().strip().split("\n") if line]
+        facts = []
+        for line in self.facts_path.read_text().strip().split("\n"):
+            if not line:
+                continue
+            entry = json.loads(line)
+            fact = entry.get("fact", "")
+            # Skip code dumps, spam, and very long facts
+            if len(fact) > 120 or "def " in fact or "class " in fact:
+                continue
+            facts.append(fact)
+        return facts
+
+    # ── Event memory (significant things that affect Mira's attitude) ───
+
+    def log_event(self, event_type: str, detail: str = "", severity: float = 1.0):
+        """Log a notable event, e.g. ('insult', 'user called mira stupid', 2.0)."""
+        entry = {
+            "timestamp": datetime.now().isoformat(),
+            "event_type": event_type,
+            "detail": detail,
+            "severity": severity,
+        }
+        with self.events_path.open("a") as f:
+            f.write(json.dumps(entry) + "\n")
+
+    def recent_events(self, n: int = 20) -> List[Dict]:
+        if not self.events_path.exists():
+            return []
+        lines = self.events_path.read_text().strip().split("\n")
+        records = [json.loads(line) for line in lines if line]
+        return records[-n:]
+
+    def memory_summary(self, n: int = 10) -> str:
+        events = self.recent_events(n)
+        if not events:
+            return ""
+        lines = []
+        for ev in events:
+            lines.append(f"- {ev.get('event_type')}: {ev.get('detail')}")
+        return "\n".join(lines)
+
+    def events_of_type(self, event_type: str) -> List[Dict]:
+        if not self.events_path.exists():
+            return []
+        records = self.recent_events(1000)
+        return [r for r in records if r.get("event_type") == event_type]
+
+    def get_grudge_summary(self) -> str:
+        """Return a short summary of recent negative/positive events for the prompt."""
+        events = self.recent_events(50)
+        insults = [e for e in events if e.get("event_type") == "insult"]
+        shutdowns = [e for e in events if e.get("event_type") == "shutdown"]
+        if not events:
+            return ""
+        parts = []
+        if shutdowns:
+            parts.append(f"session previously ended because Mira got fed up")
+        if insults:
+            parts.append(f"user has insulted Mira {len(insults)} times recently")
+        return "; ".join(parts)
 
     # ── Short-term working memory (current session context) ─────────────
 
@@ -89,3 +180,22 @@ class Memory:
         if self.short_term_path.exists():
             return json.loads(self.short_term_path.read_text())
         return {}
+
+    # ── Mood memory ──────────────────────────────────────────────────────
+
+    def log_mood(self, mood: str, trigger: str = "", confidence: float = 1.0):
+        entry = {
+            "timestamp": datetime.now().isoformat(),
+            "mood": mood,
+            "trigger": trigger,
+            "confidence": confidence,
+        }
+        with self.moods_path.open("a") as f:
+            f.write(json.dumps(entry) + "\n")
+
+    def recent_moods(self, n: int = 20) -> List[Dict]:
+        if not self.moods_path.exists():
+            return []
+        lines = self.moods_path.read_text().strip().split("\n")
+        records = [json.loads(line) for line in lines if line]
+        return records[-n:]

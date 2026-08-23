@@ -501,6 +501,26 @@ class Tools:
         path = self._resolve_path(args["path"])
         if not self._is_safe(path):
             return f"refused: {path}"
+        if path.suffix.lower() == ".pdf":
+            try:
+                from pypdf import PdfReader
+                reader = PdfReader(str(path))
+                parts = []
+                for page in reader.pages:
+                    page_text = page.extract_text()
+                    if page_text:
+                        parts.append(page_text)
+                text = "\n".join(parts).strip()
+                if not text:
+                    return "pdf exists but has no extractable text"
+                max_chars = 8000
+                if len(text) > max_chars:
+                    text = text[:max_chars] + "\n\n[truncated: pdf has more text]"
+                return text
+            except ImportError:
+                return "pdf found but pypdf is not installed. run: pip3 install pypdf"
+            except Exception as e:
+                return f"could not read pdf: {e}"
         try:
             return path.read_text(encoding="utf-8")
         except Exception as e:

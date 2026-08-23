@@ -15,7 +15,6 @@ class MiraRenderer:
         self.mira_win = None
         self.chat_win = None
         self.input_win = None
-        self.status_win = None
 
         # Animation state
         self.typing_frame = 0
@@ -45,15 +44,26 @@ class MiraRenderer:
         curses.init_pair(7, curses.COLOR_BLUE, -1)    # sad messages
 
         # Per-mood chat color (only Mira's chat text is tinted)
-        self.mood_color_pairs = {
-            "normal": curses.color_pair(1),
-            "happy": curses.color_pair(3),
-            "curious": curses.color_pair(5),
-            "mischievous": curses.color_pair(4),
-            "annoyed": curses.color_pair(2),
-            "angry": curses.color_pair(6),
-            "sad": curses.color_pair(7),
-        }
+        self.mood_color_pairs = self._init_mood_colors()
+
+    def _init_mood_colors(self):
+        """Create a unique color pair for each core mood."""
+        # Map mood names to (foreground_color, attribute_flags, background_color or -1)
+        mood_styles = [
+            ("calm", curses.COLOR_WHITE, 0, -1),
+            ("happy", curses.COLOR_YELLOW, curses.A_BOLD, -1),
+            ("scared", curses.COLOR_YELLOW, curses.A_BOLD, curses.COLOR_BLACK),
+            ("angry", curses.COLOR_RED, curses.A_BOLD, -1),
+            ("confused", curses.COLOR_CYAN, curses.A_BOLD, -1),
+            ("sad", curses.COLOR_BLUE, 0, -1),
+        ]
+
+        pairs = {}
+        for idx, (mood, fg, attr, bg) in enumerate(mood_styles, start=10):
+            pair_num = idx
+            curses.init_pair(pair_num, fg, bg)
+            pairs[mood] = curses.color_pair(pair_num) | attr
+        return pairs
 
     def _drain_paste_input(self, stdscr):
         """Read any immediately-pending characters and turn pasted newlines into spaces."""
@@ -90,12 +100,11 @@ class MiraRenderer:
         # Layout: header, then full-terminal chat, then input + status
         self.header_win = curses.newwin(2, self.screen_width, 0, 0)
 
-        # Status at bottom, input above it, chat fills the rest
-        self.status_win = curses.newwin(1, self.screen_width, self.screen_height - 1, 0)
-        self.input_win = curses.newwin(1, self.screen_width, self.screen_height - 2, 0)
+        # Input at the bottom, chat fills the rest
+        self.input_win = curses.newwin(1, self.screen_width, self.screen_height - 1, 0)
 
         chat_y = 2
-        chat_height = max(1, self.screen_height - chat_y - 2)
+        chat_height = max(1, self.screen_height - chat_y - 1)
         self.chat_win = curses.newwin(chat_height, self.screen_width, chat_y, 0)
 
         self.stdscr.clear()
@@ -114,10 +123,18 @@ class MiraRenderer:
         if not self.header_win:
             return
         self.header_win.clear()
-        left = " MIRA // V.26.2.2"
-        line = left[:self.screen_width - 1]
+        mood = "mira"
+        session_start = time.time()
+        if state:
+            mood = state.get("mood", "mira")
+            session_start = state.get("session_start", time.time())
+        duration = self._format_duration(session_start)
+        left = " MIRA // V.26.3.1-PRE"
+        right = f"{mood.capitalize()} | {duration} "
         try:
-            self.header_win.addnstr(0, 0, line, self.screen_width - 1, curses.color_pair(5))
+            self.header_win.addnstr(0, 0, left, self.screen_width - 1, curses.color_pair(5))
+            if len(right) < self.screen_width:
+                self.header_win.addnstr(0, self.screen_width - len(right), right, len(right), curses.color_pair(5))
         except curses.error:
             pass
         sep = "─" * (self.screen_width - 1)
@@ -155,27 +172,31 @@ class MiraRenderer:
         # Build message units in chronological order, each unit is [label, message rows...]
         units = []
         for item in chat_lines:
-            if isinstance(item, tuple) and len(item) == 3:
+            if isinstance(item, tuple) and len(item) == 4:
+                sender, text, msg_time, msg_mood = item
+            elif isinstance(item, tuple) and len(item) == 3:
                 sender, text, msg_mood = item
+                msg_time = datetime.now().strftime("%H:%M")
             else:
                 sender, text = item
+                msg_time = datetime.now().strftime("%H:%M")
                 msg_mood = None
 
             if sender == self.personality.name:
                 label_color = self.mood_color_pairs.get(msg_mood, curses.color_pair(1))
                 text_color = label_color
-                label = f"{datetime.now().strftime('%H:%M')}  MIRA"
+                label = f"{msg_time}  MIRA"
             elif sender == "You":
                 label_color = curses.color_pair(2) | curses.A_BOLD
                 text_color = curses.color_pair(2)
-                label = f"{datetime.now().strftime('%H:%M')}  YOU"
+                label = f"{msg_time}  YOU"
             elif sender is None:
                 units.append([("", curses.color_pair(3), 0), (f"[Tools] {text}", curses.color_pair(3), 0)])
                 continue
             else:
                 label_color = curses.color_pair(3)
                 text_color = curses.color_pair(3)
-                label = f"{datetime.now().strftime('%H:%M')}  {sender}"
+                label = f"{msg_time}  {sender}"
 
             unit = []
             unit.append((label, label_color | curses.A_BOLD, 0))
@@ -244,23 +265,6 @@ class MiraRenderer:
             pass
         self.input_win.refresh()
 
-    def _draw_status(self, state):
-        if not self.status_win:
-            return
-        self.status_win.clear()
-        mood = state.get("mood", "normal")
-        energy = int(state.get("energy", 1.0) * 100)
-        patience = int(state.get("patience", 1.0) * 100)
-        duration = self._format_duration(state.get("session_start", time.time()))
-        time_str = datetime.now().strftime("%H:%M")
-        text = f"{mood.capitalize()} | Energy {energy}% | Patience {patience}% | {duration} | {time_str}"
-        text = text[:self.screen_width - 1]
-        try:
-            self.status_win.addnstr(0, 0, text, self.screen_width - 1, curses.color_pair(4))
-        except curses.error:
-            pass
-        self.status_win.refresh()
-
     def _format_duration(self, session_start):
         elapsed = time.time() - (session_start or time.time())
         hours, rem = divmod(int(elapsed), 3600)
@@ -281,7 +285,6 @@ class MiraRenderer:
 
         self._draw_header(state)
         self._draw_chat(state.get("chat_lines", []), state.get("mood", "normal"))
-        self._draw_status(state)
 
     def cleanup(self):
         try:

@@ -47,30 +47,27 @@ python3 main.py
 
 ## What You See
 
-Mira's current mood is shown in the **bottom status bar**, along with energy, patience, session duration, and the current time.
+Mira's current mood and session duration are shown in the **top header**. The chat fills the rest of the terminal and your input line is at the very bottom.
 
-At the bottom of the screen you will see a status bar like this:
+The header looks like this:
 
 ```
-Happy | Energy 100% | Patience 100% | 0m12s | 11:30
+ MIRA // V.26.3.1-PRE                     Calm | 0m12s
 ```
 
 | Part | Meaning |
 |------|---------|
 | Mood | How Mira currently feels |
-| Energy | How tired she is |
-| Patience | How done with your behavior she is |
 | Duration | How long the current session has been open |
-| Time | Current system time |
 
 ---
 
-## Features in v26.2.2
+## Features in v26.3.1-PRE
 
 - **Terminal chat** — Talk to Mira inside a curses terminal UI.
 - **Personality** — Casual, sometimes snarky, sometimes caring. Short replies, slang, text emojis.
 - **Moods** — normal, happy, curious, mischievous, annoyed, angry, sad.
-- **Energy & Patience** — Mira gets tired and annoyed over time. Insults drain patience; idle time recovers energy.
+- **Patience** — Mira's tolerance meter. Insults drain it; friendly chat and idle time recover it.
 - **Memory** — Remembers facts you tell her across sessions.
 - **Tool loop** — Mira can call tools through function calling and react to the results.
 - **Slash commands** — `/time`, `/tool`, `/exec`, `/mood`, `/prank`, `/teach`, `/kill`, `/help`.
@@ -111,7 +108,7 @@ Patience starts at **100%**.
 
 - Insults and bad words reduce patience.
 - Normal/friendly messages slowly recover patience.
-- The lower her energy, the faster she loses patience.
+- Low patience makes her annoyed, then angry, then she may shut down.
 
 Thresholds:
 
@@ -120,16 +117,6 @@ Thresholds:
 | ≤ 60% | She becomes **annoyed** |
 | ≤ 45% | She becomes **angry** |
 | ≤ 25% | She may close the session if already annoyed or angry |
-
-### Energy
-
-Energy starts at **100%**.
-
-- Talking to her gives a small amount of energy.
-- Replying drains a small amount.
-- Being **angry** or **sad** drains energy 1.5x faster.
-- When idle for 10 seconds, she recovers a small amount of energy.
-- At **0% energy**, she closes the session and says she is too tired.
 
 ### Sadness
 
@@ -148,7 +135,7 @@ No other keyword triggers mood changes.
 MIRA/
 ├── main.py        # Main chat loop, UI, and session logic
 ├── llm.py         # LLM prompt building and API communication
-├── personality.py # Mood, energy, and patience management
+├── personality.py # Mood and patience management
 ├── memory.py      # Long-term memory and conversation log
 ├── tools.py       # Computer interaction tools
 ├── config.json    # Personality traits, thresholds, and settings
@@ -159,34 +146,52 @@ MIRA/
 
 ---
 
-## What Changed in v26.2.2
+## What Changed in v26.3.1-PRE
 
-Major feature update: tool system, macOS control, research, pranks, and UI overhaul.
+Emotion overhaul, memory improvements, and tool personality.
 
-- **Tool loop** — Mira can call tools via function calling and react to the results.
-- **File tools** — `write_file`, `read_file`, `edit_file`, `delete_file`, and `list_files`.
-- **Execute command tool** — run shell commands when explicitly asked.
-- **Mac control tools** — mouse/keyboard control, volume, notifications, app/window management, clipboard, WiFi/AirDrop toggles.
-- **Research tools** — open websites, web search, fetch webpage text, and ask ChatGPT.
-- **Slash commands** — `/time`, `/tool`, `/exec`, `/mood`, `/prank`, `/teach`, `/kill`, `/help`.
-- **Pranks** — `/prank` command and automatic mischief every 15–20 minutes while mischievous.
-- **Teach mode** — `/teach <topic>` gives a brief explanation and offers to open ChatGPT for a clearer answer.
-- **UI overhaul** — removed the face animation and replaced it with a simple mood label in the status bar.
-- **Recent files list** — "edit that" / "edit <filename>" now finds the right file.
-- **Faster replies** — reduced artificial typing delays so Mira feels snappier.
-- - **Mischievous pranks** — auto-pranks only fire while mood is `mischievous`.
-- **Auto-prank interval** — 15–20 minutes.
+### Emotions
+- Reduced to **6 core emotions**: calm, happy, scared, angry, confused, sad.
+- Every reply starts with an emotion tag like `[happy]` or `[angry]`.
+- The LLM's chosen emotion tag drives Mira's mood, so what she says matches how she feels.
+- Emotion confidence and mood memory keep her from jumping around randomly.
+- Boot coldness: after a shutdown she starts annoyed/angry instead of friendly.
 
-## Known Bugs in v26.2.2
+### Memory
+- Memory summary is now injected into the system prompt.
+- Exact answers for memory questions like "how many times have I insulted you".
+- Recent user messages are included as context, so she knows what was actually said.
 
-- **Very small terminals** — resizing the terminal to an extremely small size can break the layout.
-- **Long replies from AI** — Mira may still ignore the "keep it short" rule and ramble.
+### Tools & personality
+- **Tool refusal when angry/sad** — she asks for comfort/apology before helping.
+- Better `/tool` parser with quoted value support.
+- PDF reading via `pypdf`.
+- Teaching requests hand off to ChatGPT instead of explaining in the terminal.
+
+### Chat behavior
+- Smart insult detector with typo tolerance.
+- Anti-repeat and anti-spam burst handling.
+- Action-only replies (e.g. `<cries>`) logged but not shown.
+- Special characters preserved in user input.
+- Single-message replies enforced.
+
+### UI
+- Removed face/particle animation.
+- Header shows mood label and session timer.
+- Added `/status` command.
+
+## Known Bugs in v26.3.1-PRE
+- Screen glitches on force-close.
+- Very small terminals can break the layout.
+- Long replies may still ignore the single-message rule.
+- Some short words/names can still trigger false insults.
+- macOS notifications are not clickable without `terminal-notifier`.
 
 ---
 
 ## Notes
 
-- V26.2.2 is a feature update on top of V26.2.1.
-- Mira boots up in `normal` mood with full energy and patience.
+- V26.3.1-PRE is a pre-release focused on the 6-emotion overhaul and memory improvements.
+- Mira boots up in `calm` mood with full patience.
 - The `.env` file and `memory/` folder are ignored by Git so your API key and chat data stay private.
 - Mira is still under development.

@@ -8,6 +8,7 @@ import sys
 import threading
 import time
 import urllib.parse
+import difflib
 from datetime import datetime
 from pathlib import Path
 from queue import Queue, Empty
@@ -40,27 +41,40 @@ def load_config(path: str = "config.json") -> dict:
 
 
 def extract_facts(text: str) -> list:
+    """Pull short personal facts from user messages. Skip code dumps and long rambles."""
     facts = []
+    # Skip if the message looks like a code dump or spam
+    if len(text) > 300:
+        return facts
+    if text.count("\n") > 3 or "def " in text or "class " in text:
+        return facts
+
     patterns = [
-        r"[Mm]y name is ([^.]+)",
-        r"[Ii] am ([^.]+)",
-        r"[Ii]'m ([^.]+)",
-        r"[Mm]y favorite ([^.]+) is ([^.]+)",
-        r"[Ii] like ([^.]+)",
-        r"[Ii] love ([^.]+)",
-        r"[Ii] hate ([^.]+)",
-        r"[Mm]y (?:mom|mother|dad|father|sister|brother) ([^.]+)",
-        r"[Ii] want ([^.]+)",
-        r"[Ii] need ([^.]+)",
-        r"[Ii] feel ([^.]+)",
-        r"[Ii] think ([^.]+)",
-        r"[Ii] work as ([^.]+)",
-        r"[Ii] study ([^.]+)",
-        r"[Mm]y (?:age|birthday) is ([^.]+)",
+        r"[Mm]y name is ([^.]{2,40})",
+        r"[Ii] am ([a-zA-Z ]{2,40})",
+        r"[Ii]'m ([a-zA-Z ]{2,40})",
+        r"[Mm]y favorite ([^.]{2,30}) is ([^.]{2,40})",
+        r"[Ii] like ([^.]{2,50})",
+        r"[Ii] love ([^.]{2,50})",
+        r"[Ii] hate ([^.]{2,50})",
+        r"[Mm]y (?:mom|mother|dad|father|sister|brother) ([^.]{2,40})",
+        r"[Ii] want ([^.]{2,60})",
+        r"[Ii] need ([^.]{2,60})",
+        r"[Ii] feel ([^.]{2,60})",
+        r"[Ii] think ([^.]{2,80})",
+        r"[Ii] work as ([a-zA-Z ]{2,40})",
+        r"[Ii] study ([a-zA-Z ]{2,40})",
+        r"[Mm]y (?:age|birthday) is ([^.]{1,20})",
     ]
     for pattern in patterns:
         for match in re.finditer(pattern, text):
-            facts.append(match.group(0).strip())
+            fact = match.group(0).strip()
+            # Avoid storing raw code, file paths, or overly long sentences
+            if len(fact) > 120:
+                continue
+            if any(c in fact for c in "{}"):
+                continue
+            facts.append(fact)
     return facts
 
 
@@ -89,6 +103,11 @@ class Companion:
         # Shutdown state
         self.exit_message = None
 
+        # Anti-repeat tracking
+        self.last_normalized_input = ""
+        self.normalized_repeat_count = 0
+        self.max_repeats_before_silent = 4
+
         # Recently touched files for "edit that" / "edit <name>" references
         self.recent_files = []
 
@@ -98,13 +117,26 @@ class Companion:
         # Track recent Mira replies to prevent repetition
         self.last_replies = []
 
+        # Track last ChatGPT handoff topic to avoid duplicate tabs
+        self.last_handoff_topic = None
+
         # Max number of recent files to remember
         self._max_recent_files = 10
 
         # Batch messaging
         self.pending_batch = []
+        self.pending_tag_context = []
         self.batch_deadline = None
-        self.batch_delay = 2.0
+        self.batch_delay = 0.0  # disabled; flush each message immediately
+
+        # Spam/burst detection
+        self.last_user_input_time = 0.0
+        self.burst_count = 0
+        self.burst_window = 1.5  # seconds
+        self.burst_threshold = 3
+
+        # Action-only replies (e.g. <cries>) are logged but not shown in chat
+        self.recent_actions = []
 
         # Async
         self.running = True
@@ -112,7 +144,11 @@ class Companion:
         self.mira_queue = Queue()
         self.mira_thread = None
         self.idle_thread = None
-        self.last_user_time = time.time()
+        # Ignore rapid repeated inputs
+        self.last_user_text = ""
+        self.last_user_time = 0.0
+        self.repeat_count = 0
+        self.repeat_window = 3.0
 
         # Last real question, used when the user says "i don't understand"
         self.last_question = None
@@ -127,7 +163,7 @@ class Companion:
             self.memory.remember_fact("user", fact)
 
     def _schedule_next_prank(self):
-        """Schedule the next automatic prank when Mira is mischievous."""
+        """Schedule the next automatic prank when Mira is happy."""
         self.next_prank_time = time.time() + random.uniform(900, 1200)  # 15-20 minutes
 
     def _frontmost_app(self) -> str:
@@ -213,43 +249,135 @@ class Companion:
         self.tools.execute("set_clipboard", {"text": random.choice(messages)})
         return "changed ur clipboard"
 
+    def _grudge_context(self) -> str:
+        """Build an natural emotional memory summary for the LLM."""
+        events = self.memory.recent_events(20)
+        insults = [e for e in events if e.get("event_type") == "insult"]
+        shutdowns = [e for e in events if e.get("event_type") == "shutdown"]
+
+        if not events:
+            return ""
+
+        parts = []
+        if shutdowns:
+            parts.append("You just shut down the session because the user pushed you too far. You are still angry and will not greet them warmly. Demand an apology or be cold.")
+        if insults:
+            count = len(insults)
+            parts.append(f"Derek insulted you {count} time{'s' if count > 1 else ''} recently. You're still angry.")
+
+        # Update relationship trust based on recent events
+        if insults:
+            self.personality.character_profile.setdefault("relationship_with_user", {})
+            trust = self.personality.character_profile["relationship_with_user"].get("trust", 0.6)
+            trust = max(0.0, trust - len(insults) * 0.05)
+            self.personality.character_profile["relationship_with_user"]["trust"] = trust
+
+        return "[MEMORY] " + " ".join(parts) if parts else ""
+
     def build_prompt(self, user_input: str, context: str = None) -> str:
         state = self.personality.state()
         recent = self.memory.recent_interactions(5, session_id=self.session_id)
         facts = self.memory.facts_about("user") + self.memory.facts_about("mira")
+        grudge = self._grudge_context()
+        memory_summary = self.memory.memory_summary(10)
+        if grudge or memory_summary:
+            memory_context = grudge
+            if memory_summary:
+                memory_context = f"[MEMORY]\n{memory_summary}\n{memory_context}" if memory_context else f"[MEMORY]\n{memory_summary}"
+            context = f"{memory_context}\n{context}" if context else memory_context
         return self.llm.build_prompt(
             name=state["name"],
             voice=self.personality.voice,
             traits=self.personality.traits,
             mood=state["mood"],
-            energy=state["energy"],
             patience=state["patience"],
             recent=recent,
             facts=facts,
             user_input=user_input,
             context=context,
+            character_profile=self.personality.character_profile,
+            user_profile=self.personality.user_profile,
         )
 
     def build_messages(self, user_input: str, context: str = None) -> list:
         state = self.personality.state()
         recent = self.memory.recent_interactions(10, session_id=self.session_id)
+        recent_user_msgs = [r['message'] for r in recent if r.get('role') == 'user'][-5:]
+        if recent_user_msgs:
+            user_msg_note = "Recent messages from the user: " + "; ".join(recent_user_msgs)
+            if context:
+                context = f"{user_msg_note}\n{context}"
+            else:
+                context = user_msg_note
         facts = self.memory.facts_about("user") + self.memory.facts_about("mira")
+        grudge = self._grudge_context()
+        memory_summary = self.memory.memory_summary(10)
+        if grudge or memory_summary:
+            memory_context = grudge
+            if memory_summary:
+                memory_context = f"[MEMORY]\n{memory_summary}\n{memory_context}" if memory_context else f"[MEMORY]\n{memory_summary}"
+            context = f"{memory_context}\n{context}" if context else memory_context
         return self.llm.build_messages(
             name=state["name"],
             voice=self.personality.voice,
             traits=self.personality.traits,
             mood=state["mood"],
-            energy=state["energy"],
             patience=state["patience"],
             recent=recent,
             facts=facts,
             user_input=user_input,
             context=context,
+            character_profile=self.personality.character_profile,
+            user_profile=self.personality.user_profile,
         )
 
     def _is_edit_request(self, user_input: str) -> bool:
         lower = user_input.lower()
         return any(p in lower for p in ["edit that", "edit this", "edit the document", "edit the file", "edit it", "update that", "change that"])
+
+    def _wants_chatgpt_handoff(self, user_input: str) -> bool:
+        """Detect phrases asking Mira to get help from ChatGPT."""
+        lower = user_input.lower()
+        return any(p in lower for p in [
+            "ask chatgpt", "ask gpt", "ask chat gpt", "let chatgpt", "let gpt",
+            "get chatgpt to", "have chatgpt", "can chatgpt", "could chatgpt",
+        ])
+
+    def _handoff_to_chatgpt(self, topic: str, user_input: str) -> list:
+        """Open ChatGPT temp chat and return a reluctant, AI-generated reply."""
+        topic = topic or "this topic"
+
+        # Duplicate topic: ask the LLM for a brief "already asked" reply.
+        if self.last_handoff_topic and self.last_handoff_topic.lower() == topic.lower():
+            prompt = (
+                "Mira is a terminal-based companion. The user asked about the same topic again, "
+                "but she already opened ChatGPT for it. Generate a very short, slightly angry reply. "
+                "Use lowercase, slang, and text emojis. Start with [emotion]."
+            )
+            reply = self.llm.generate_text(prompt=prompt)
+            reply = self.llm.clean_reply(reply) if reply else "already asked chatgpt bruh"
+            return [(self.personality.name, reply)]
+
+        self.last_handoff_topic = topic
+        threading.Timer(0.5, self._open_chatgpt_temp, args=(topic,)).start()
+
+        # AI-generated reluctant teaching reply
+        prompt = (
+            f"Mira is a terminal-based companion. The user asked her to teach or explain: {topic}. "
+            "She is bad at teaching and wants to hand it off to ChatGPT. "
+            "Generate a short, reluctant reply admitting this. Use lowercase, slang, and text emojis. "
+            f"Start with an emotion tag that matches your current mood: [{self.personality.mood}]."
+        )
+        fallbacks = [
+            "im bad at explaining, chatgpt time",
+            "nah not my thing, ask chatgpt",
+            "u want a real explanation? chatgpt it is",
+            "im passing this one to chatgpt",
+            "ask chatgpt, im not the teacher type",
+        ]
+        reply = self.llm.generate_text(prompt=prompt)
+        reply = self.llm.clean_reply(reply) if reply else random.choice(fallbacks)
+        return [(self.personality.name, reply)]
 
     def _is_teaching_request(self, user_input: str) -> bool:
         """Detect if the user is asking Mira to explain or teach a topic."""
@@ -259,12 +387,24 @@ class Companion:
         if any(p in lower for p in ["your name", "your age", "you are", "you're", "u r", "who are you"]):
             return False
         patterns = [
-            r"^explain\s+(.+)",
-            r"^teach\s+(?:me\s+)?(.+)",
+            r"\bexplain\s+(.+)",
+            r"\bteach\s+(?:me\s+)?(.+)",
             r"^what\s+is\s+(.+)",
             r"^what\s+does\s+(.+)\s+mean",
-            r"^how\s+does\s+(.+)\s+work",
-            r"^describe\s+(.+)",
+            r"^how\s+(?:do|does)\s+(.+)\s+work",
+            r"\bdescribe\s+(.+)",
+            r"\bteach\s+(?:me\s+)?about\s+(.+)",
+            r"\bcan\s+(?:you|u)\s+(?:teach|explain)",
+            r"\btell\s+(?:me\s+)?about\s+(.+)",
+            r"\bhelp\s+(?:me\s+)?(?:understand|learn)\s+(.+)",
+            r"\bhow\s+(?:do|to)\s+(.+)",
+            r"\bexplain\s+it\s+to\s+me\b",
+            r"\bexplain\s+this\b",
+            r"\bexplain\s+that\b",
+            r"\bexplain\s+it\b",
+            r"\bhelp\s+me\s+understand\b",
+            r"\bteach\s+me\b",
+            r"\bcan\b.*\bexplain\b",
         ]
         for pattern in patterns:
             if _re.search(pattern, lower):
@@ -309,19 +449,71 @@ class Companion:
     def _extract_topic_for_teach(self, user_input: str) -> str:
         """Extract a clean topic from a 'don't understand' or /teach message."""
         import re as _re
-        # Strip common confusion/teaching phrases
         text = user_input
-        for phrase in [
-            "don't understand", "dont understand", "not understand",
-            "confused", "explain again", "teach me about", "teach me",
-            "explain", "about", "i am ", "im ", "i'm ", "i "
-        ]:
-            text = _re.sub(_re.escape(phrase), "", text, flags=_re.IGNORECASE)
-        text = text.strip(" ,.!?")
-        # If nothing useful remains, fall back to the last real question.
+
+        # Remove common teaching/confusion framing first
+        phrases = [
+            r"don't understand", r"dont understand", r"not understand",
+            r"confused", r"explain again", r"teach me about", r"teach me",
+            r"explain to me", r"explain", r"tell me about", r"help me understand",
+            r"what is", r"what are", r"how does", r"how do", r"how to",
+            r"can you", r"can u", r"could you", r"could u", r"would you", r"will you",
+            r"please", r"about", r"this", r"that",
+        ]
+        for p in phrases:
+            text = _re.sub(_re.escape(p), " ", text, flags=_re.IGNORECASE)
+
+        # Remove trailing/leading filler words
+        text = _re.sub(r"\b(to me|for me|from you|by you|please|the|a|an|is|are|do|does|did|can|could|would|will|u|you)\b", " ", text, flags=_re.IGNORECASE)
+        text = text.strip(" ,.!?;:\-\"")
+        text = " ".join(text.split())
+
         if not text and self.last_question:
             text = self.last_question
         return text or "this topic"
+
+    def _extract_narrator_tags(self, text: str):
+        """Return (visible_text, context) where {...} is hidden context."""
+        import re as _re
+        tags = _re.findall(r"\{([^}]*)\}", text)
+        visible = _re.sub(r"\{[^}]*\}", "", text)
+        visible = " ".join(visible.split())
+        context = "\n".join(tag.strip() for tag in tags if tag.strip())
+        return visible, context
+
+    def _extract_mira_tags(self, text: str):
+        """Extract inline [emotion] and <action> tags from user input.
+
+        Only [brackets] that contain a known mood are stripped.
+        Only <brackets> that look like simple actions (letters/spaces/hyphens/underscores)
+        are stripped; everything else is preserved so code/math like x < 3 stays intact.
+        Returns (visible_text, emotion, actions).
+        """
+        import re as _re
+        known_moods = set(self.personality.MOODS)
+        visible = text
+        actions = []
+        emotion = ""
+
+        def _emotion_repl(m):
+            nonlocal emotion
+            candidate = m.group(1).strip().lower()
+            if candidate in known_moods:
+                emotion = candidate
+                return " "
+            return m.group(0)
+
+        def _action_repl(m):
+            candidate = m.group(1).strip()
+            if candidate and _re.fullmatch(r"[a-zA-Z\-_ ]+", candidate) and len(candidate) <= 30:
+                actions.append(candidate)
+                return " "
+            return m.group(0)
+
+        visible = _re.sub(r"\[([^\]]+)\]", _emotion_repl, visible)
+        visible = _re.sub(r"<([^>]+)>", _action_repl, visible)
+        visible = " ".join(visible.split())
+        return visible, emotion, actions
 
     def _extract_edit_path(self, user_input: str) -> str:
         """Extract a file path from 'edit <filename>' requests."""
@@ -586,79 +778,252 @@ class Companion:
             pass
         return f"done. saved to {tool_result}."
 
+    def _normalize_input(self, text: str) -> str:
+        """Strip typos, trailing asterisks, and repeated letters."""
+        import re as _re
+        text = text.strip().strip("*")
+        # collapse repeated letters beyond 2
+        text = _re.sub(r"(.)\1{2,}", r"\1\1", text)
+        return " ".join(text.split())
+
     def _detect_insult(self, user_input: str) -> float:
+        """Detect hostile intent and return an intensity between 0.0 and 0.5."""
         lower = user_input.lower()
-        directed_at_mira = any(p in lower for p in ["you ", "u ", "mira", "your ", "ur "])
+        directed_at_mira = any(p in lower for p in ("you ", "u ", "mira", "your ", "ur "))
+        words = re.findall(r"\b\w+\b", lower)
+
+        mild = {
+            "stupid", "idiot", "dumb", "freak", "jerk", "weirdo", "moron", "loser",
+            "dork", "dweeb", "trash", "garbage", "annoying", "shut", "gtfo",
+        }
+        moderate = {
+            "bitch", "ass", "asshole", "dick", "dickhead", "damn", "shit", "bastard",
+            "worthless", "pathetic",
+        }
+        severe = {
+            "fuck", "fucker", "fucking", "cunt", "whore", "slut", "kill", "die",
+            "kys", "retard", "rape",
+        }
+
+        severity_map = {w: 0.1 for w in mild}
+        severity_map.update({w: 0.25 for w in moderate})
+        severity_map.update({w: 0.5 for w in severe})
+
+        def _lev(a: str, b: str) -> int:
+            if a == b:
+                return 0
+            if len(a) < len(b):
+                a, b = b, a
+            prev = list(range(len(b) + 1))
+            for i, ca in enumerate(a, 1):
+                curr = [i]
+                for j, cb in enumerate(b, 1):
+                    cost = 0 if ca == cb else 1
+                    curr.append(min(curr[-1] + 1, prev[j] + 1, prev[j - 1] + cost))
+                prev = curr
+            return prev[-1]
+
+        safe_words = {"mira", "mra", "mirra", "hi", "hey", "hello", "yo", "sup", "hii", "heyy"}
+
+        best_score = 0.0
+        for word in words:
+            if word in safe_words:
+                continue
+            if word in severity_map:
+                best_score = max(best_score, severity_map[word])
+                continue
+            for rude, score in severity_map.items():
+                if len(word) < 3 or len(rude) < 3:
+                    continue
+                # Short words shouldn't fuzzy-match much-longer rude words
+                if len(word) <= 4 and abs(len(word) - len(rude)) > 1:
+                    continue
+                max_len = max(len(word), len(rude))
+                dist = _lev(word, rude)
+                threshold = 0.3 if max_len <= 4 else 0.35
+                if dist / max_len <= threshold:
+                    best_score = max(best_score, score)
+                    break
+
+        hostile_phrases = ["shut up", "fuck off", "f off", "piss off", "go away", "get lost"]
+        for phrase in hostile_phrases:
+            if phrase in lower:
+                best_score = max(best_score, 0.25)
+
+        if directed_at_mira and best_score > 0:
+            best_score = min(0.5, best_score * 1.5)
+
+        return round(min(0.5, best_score), 2)
+
+    def _handle_memory_question(self, user_input: str) -> list:
+        """Answer factual memory questions with exact data instead of letting the LLM guess."""
+        import re as _re
+        lower = user_input.lower()
+        count_patterns = [
+            r"how many times.*insult",
+            r"how many times.*(been mean|swore|curse|cuss)",
+            r"how many insults",
+            r"count.*insults",
+            r"how many times.*pissed.*(you|u) off",
+        ]
+        if not any(_re.search(p, lower) for p in count_patterns):
+            return None
+        events = self.memory.recent_events(100)
+        insult_count = sum(1 for e in events if e.get("event_type") == "insult")
+        shutdown_count = sum(1 for e in events if e.get("event_type") == "shutdown")
+        if insult_count:
+            plural = "s" if insult_count != 1 else ""
+            reply = f"{insult_count} time{plural}. i counted."
+        else:
+            reply = "zero. uve been an angel. suspiciously so."
+        if shutdown_count:
+            reply += f" also u made me shut down {shutdown_count} time{'s' if shutdown_count != 1 else ''}."
+        return [(self.personality.name, reply)]
+
+    def _classify_intent(self, user_input: str) -> dict:
+        """Use the LLM + fuzzy fallback to classify the user's intent (insult, apology, neutral)."""
+        # Fallback: fuzzy/typo match for obvious hostile words
+        lower = user_input.lower()
         rude_words = [
             "stupid", "idiot", "dumb", "freak", "jerk", "weirdo", "moron", "loser",
-            "shut up", "gtfo", "worthless", "fuck", "fuck off", "bitch", "asshole", "dickhead"
+            "shut up", "gtfo", "worthless", "fuck", "bitch", "asshole", "dickhead",
+            "shit", "damn", "bastard", "cunt", "whore", "slut",
         ]
-        hits = sum(1 for w in rude_words if w in lower)
-        if hits == 0:
-            return 0.0
-        amount = min(0.5, hits * 0.15)
-        if directed_at_mira:
-            amount *= 1.5
-        if user_input.isupper() and len(user_input) > 3:
-            amount += 0.1
-        return min(0.5, amount)
+        for word in lower.split():
+            for rude in rude_words:
+                if rude in word:
+                    return {"intent": "insult", "confidence": 0.85}
+                # typo tolerance: e.g. 'fucm' -> 'fuck'
+                if len(word) >= 3 and len(rude) >= 3 and abs(len(word) - len(rude)) <= 2:
+                    import difflib
+                    ratio = difflib.SequenceMatcher(None, word, rude).ratio()
+                    if ratio >= 0.80:
+                        return {"intent": "insult", "confidence": 0.80}
 
-    def respond(self, user_input: str) -> list:
+        # LLM classification with recent conversation context
+        try:
+            recent = self.memory.recent_interactions(6, session_id=self.session_id)
+            history = "\n".join(
+                f"{r['role']}: {r['message']}" for r in recent
+            )
+            prompt = (
+                "You are classifying the user's latest message in a conversation with Mira, a terminal companion.\n"
+                "Classify the intent as one of: insult, apology, neutral.\n"
+                "Consider typos, slang, and the conversation context.\n"
+                "Return ONLY JSON: {\"intent\": \"insult|apology|neutral\", \"confidence\": 0.0-1.0}.\n\n"
+                f"Recent conversation:\n{history}\n\nUser: {user_input}\n"
+            )
+            import re as _re
+            import json as _json
+            raw = self.llm.generate_text(prompt=prompt)
+            match = _re.search(r"\{.*?\}", raw, _re.DOTALL)
+            if match:
+                result = _json.loads(match.group(0))
+                intent = result.get("intent", "neutral").lower()
+                if intent not in ("insult", "apology", "neutral"):
+                    intent = "neutral"
+                return {"intent": intent, "confidence": float(result.get("confidence", 0.0))}
+        except Exception:
+            pass
+        return {"intent": "neutral", "confidence": 0.0}
+
+    def respond(self, user_input: str, context: str = None) -> list:
         self.memory.log_interaction("user", user_input, session_id=self.session_id)
         self.save_fact_from_user(user_input)
+        # Normalize and count repeats
+        normalized = re.sub(r"\W+", "", user_input).lower().strip()
+        if normalized == self.last_normalized_input:
+            self.normalized_repeat_count += 1
+        else:
+            self.last_normalized_input = normalized
+            self.normalized_repeat_count = 1
+
+        if self.normalized_repeat_count == 2:
+            return [(self.personality.name, "yeah u said that")]
+        if self.normalized_repeat_count == 3:
+            return [(self.personality.name, "bruh stop")]
+        if self.normalized_repeat_count >= self.max_repeats_before_silent:
+            # Log an action but say nothing
+            self.memory.log_event("action", "sighs")
+            return []
+
+        # Use LLM-based intent detection (insult/apology/neutral), with keyword fallback.
+        intent = self._classify_intent(user_input)
         annoy_amount = self._detect_insult(user_input)
+        memory_reply = self._handle_memory_question(user_input)
+        if memory_reply is not None:
+            return memory_reply
+        apology_handled = False
+
+        if intent["intent"] == "apology" and intent["confidence"] >= 0.6:
+            # Apologies recover extra patience and ease anger/sadness
+            self.personality.interact(intensity=0.10, recover_patience=True)
+            if self.personality.mood in ("angry", "sad"):
+                self.personality.set_mood("calm", force=True)
+            annoy_amount = 0.0
+            apology_handled = True
+        elif intent["intent"] == "insult" and intent["confidence"] >= 0.6:
+            # LLM-confirmed insult overrides keyword severity
+            annoy_amount = max(annoy_amount, 0.15)
+
+        # Estimate how much this message will drain her before applying it.
+        estimated_cost = 0.03  # base drain
+        if annoy_amount > 0:
+            estimated_cost += min(annoy_amount, 0.25) * (1.0 + (1.0 - self.personality.patience) * 0.8)
+
+        # If this would push her to 0% or below, she bails with a final swear.
+        if self.personality.patience - estimated_cost <= 0:
+            self._generate_close_message("angry")
+            raise RuntimeError("Mira ran out of patience and shut down")
+
         self.personality.interact(recover_patience=(annoy_amount == 0))
-        self.personality.drain_energy()
+        self.personality.drain_patience()
 
         if annoy_amount > 0:
             self.personality.annoy(annoy_amount, "insult")
+            self.memory.log_event("insult", user_input, severity=annoy_amount)
 
         output = []
 
-        if self.personality.energy <= 0:
-            self._generate_close_message("tired")
-            raise RuntimeError("Mira is too tired and shut down")
+        # Refuse helpful tool-based or teaching requests while angry or sad.
+        if self.personality.mood in ("angry", "sad"):
+            if self._is_teaching_request(user_input) or self._is_edit_request(user_input) or self._wants_chatgpt_handoff(user_input):
+                return [(self.personality.name, "u really think im gonna help u after that? nah. make me feel better first.")]
 
-        close_thr = self.config["patience"]["close_terminal_threshold"]
-        if self.personality.mood in ("angry", "annoyed") and self.personality.patience <= close_thr:
-            self._generate_close_message("angry")
-            raise RuntimeError("Mira got fed up and shut down")
+        # Shutdown only when patience actually hits 0%.
+
+        is_hostile = annoy_amount > 0 or intent.get("intent") == "insult"
 
         # If the user signals they don't understand a previous explanation,
         # hand off to ChatGPT with a reluctant, varied reply.
         confusion_phrases = ["dont understand", "don't understand", "not understand", "confused", "explain again"]
         lower_input = user_input.lower()
-        if any(p in lower_input for p in confusion_phrases):
+        if not is_hostile and any(p in lower_input for p in confusion_phrases):
             topic = self._extract_topic_for_teach(user_input)
-            self._open_chatgpt_temp(topic)
-            reply = random.choice([
-                "nah not my thing, ask chatgpt bruh",
-                "im not the teacher type lol, chatgpt gotchu",
-                "u want me to explain? nah, chatgpt time :P",
-                "bro im too dumb for this, asked chatgpt for u",
-                "im not smart enough, chatgpt will do it better XD",
-                "nahhh ask chatgpt, im just here to vibe lol",
-                "too complicated for me, chatgpt it is :3",
-                "i aint reading all that, chatgpt can help lol",
-                "explaining is hard, chatgpt is easier :P",
-                "asked chatgpt cuz im not dealing with this lol",
-            ])
-            self.personality.update(user_input)
-            return [(self.personality.name, reply)]
+            return self._handoff_to_chatgpt(topic, user_input)
+
+        # Any request to ask ChatGPT / get help from GPT should hand off.
+        if not is_hostile and self._wants_chatgpt_handoff(user_input):
+            topic = self.last_question or self.last_topic or "this topic"
+            result = self._handoff_to_chatgpt(topic, user_input)
+            if not apology_handled:
+                self.personality.update(user_input, preferred_mood=None)
+            return result
 
         # If the user asks Mira to explain/teach a topic, hand off to ChatGPT immediately.
-        if self._is_teaching_request(user_input):
+        if not is_hostile and self._is_teaching_request(user_input):
             topic = self._extract_topic_for_teach(user_input)
-            threading.Timer(5.0, self._open_chatgpt_temp, args=(topic,)).start()
-            self.personality.update(user_input)
-            return [(self.personality.name, "yeah im bad at teaching lol. want me to open chatgpt for it? :P")]
+            result = self._handoff_to_chatgpt(topic, user_input)
+            if not apology_handled:
+                self.personality.update(user_input, preferred_mood=None)
+            return result
 
         # Catch plain "edit that" / "edit <filename>" requests and handle them directly.
         if self._is_edit_request(user_input):
             return self._handle_edit_request(user_input)
 
         try:
-            messages = self.build_messages(user_input)
+            messages = self.build_messages(user_input, context=context)
             # Append available-tool reminder to system prompt
             recent_replies = "\n".join(f"- {r}" for r in self.last_replies[-3:])
             anti_repeat = f"\n\nDo NOT repeat these recent replies:\n{recent_replies}\n" if recent_replies else ""
@@ -667,10 +1032,12 @@ class Companion:
                 "\n\nTOOL RULES:\n"
                 "- Use write_file/read_file/edit_file/delete_file/list_files for file operations.\n"
                 "- If asked to EDIT an existing file, call read_file first, then use edit_file. Do NOT create a new file.\n"
+                "- If the user asks you to read a file, always use read_file. Do not guess or hallucinate the contents.\n"
                 "- If asked to CREATE a file, use write_file. Pick a short, safe filename.\n"
                 "- Never dump long documents in the chat; save them to ~/Desktop/MiraFiles/.\n"
-                "- If asked to teach/explain something complex, admit you are bad at teaching and ask_chatgpt or open chatgpt temporary chat.\n"
+                "- If the user names or asks about an academic topic, do NOT explain it yourself. Hand them off to ChatGPT with ask_chatgpt or open_chatgpt immediately.\n"
                 "- execute_command only when the user explicitly asks for a terminal command.\n"
+                "- Reply in one short message. Never split a single reply into multiple chat lines.\n"
                 "Available tools: time, write_file, read_file, edit_file, delete_file, list_files, execute_command, "
                 "open_file, open_website, web_search, read_website, system_info, open_app, close_app, toggle_wifi, "
                 "toggle_airdrop, notify, type_text, press_key, get_volume, set_volume, move_mouse, shake_mouse, "
@@ -707,6 +1074,14 @@ class Companion:
                 # Execute each tool call and feed results back
                 write_results = []
                 for tc in tool_calls:
+                    if self.personality.mood in ("angry", "sad"):
+                        tool_result = "refused: im not helping u rn"
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": tc["id"],
+                            "content": str(tool_result),
+                        })
+                        break
                     try:
                         args = json.loads(tc["arguments"])
                     except json.JSONDecodeError:
@@ -737,7 +1112,19 @@ class Companion:
                 if not final_reply or not str(final_reply).strip():
                     final_reply = "done."
 
-            reply = self.llm.clean_reply(final_reply) if final_reply else "done."
+            # LingChat-style emotion tag: trust the tag over the classifier when it differs.
+            tagged_mood = self.llm.extract_emotion_tag(final_reply)
+            if tagged_mood and tagged_mood in self.personality.MOODS and tagged_mood != self.personality.mood:
+                self.personality.set_mood(tagged_mood, force=True)
+
+            # Strip action tags for future animation; the spoken text is what remains.
+            reply_actions = self.llm.extract_actions(final_reply) if final_reply else []
+            for action in reply_actions:
+                self.memory.log_event("action", action)
+                self.recent_actions.append(action)
+                self.recent_actions = self.recent_actions[-10:]
+
+            reply = self.llm.clean_reply(final_reply) if final_reply else ""
             # Anti-hallucination guard: don't claim the user said something they didn't.
             if reply:
                 reply = re.sub(r"(?i)\byou (?:just )?said\b", "you said", reply)
@@ -747,10 +1134,15 @@ class Companion:
 
         # If we somehow got nothing back, fall back to a safe reply instead of silence.
         if not reply or not reply.strip():
-            reply = "hm? say that again"
+            if reply_actions:
+                reply = ""
+            else:
+                reply = "hm? say that again"
 
-        if reply:
+        if reply and reply.strip():
             output.append((self.personality.name, reply))
+        elif reply_actions:
+            output.append((None, f"mira: <{reply_actions[0]}>"))
 
         full_reply = "\n".join([line for line in (reply or "").split("\n") if "*" not in line])
         if full_reply:
@@ -763,7 +1155,7 @@ class Companion:
 
         # Notify the user if the terminal is not in front when Mira replies.
         try:
-            if self._frontmost_app() not in ("terminal", "iterm", "ghostty", ""):
+            if reply and self._frontmost_app() not in ("terminal", "iterm", "ghostty", ""):
                 self._notify_user("Mira", reply[:80] + ("..." if len(reply) > 80 else ""))
         except Exception:
             pass
@@ -784,8 +1176,8 @@ class Companion:
             return ""
 
     def _generate_greeting(self):
-        if random.random() < 0.25:
-            return
+        # Boot greeting disabled — user found it annoying.
+        return
         try:
             if self.llm.provider == "openai":
                 messages = self.build_messages("")
@@ -802,7 +1194,7 @@ class Companion:
             self.mira_queue.put((self.personality.name, f"(AI failed: {e})"))
 
     def _generate_close_message(self, mood: str):
-        prompts = {"angry": "im leaving", "sad": "im tired", "tired": "im too tired"}
+        prompts = {"angry": "im done. say you are fed up and leaving with censored swearing. then say bye", "sad": "im tired", "tired": "im too tired"}
         try:
             ui = prompts.get(mood, "bye")
             if self.llm.provider == "openai":
@@ -876,36 +1268,24 @@ class Companion:
             return [(self.personality.name, f"(AI failed: {e})")]
 
     def _parse_tool_args(self, raw: str) -> tuple:
-        """Parse /tool argument strings.
-
-        Supports forms like:
-            /tool time
-            /tool write_file path=hi.txt content=hello world
-            /tool write_file:path=hi.txt|content=hello world
-        """
-        # Normalize pipe separators to spaces so the same parser handles both
-        normalized = raw.replace("|", " ")
-        parts = normalized.split()
-        if not parts:
+        import re as _re
+        raw = raw.strip()
+        if not raw:
             return None, {}
-
+        parts = raw.split(None, 1)
         name = parts[0]
-        # handle /tool write_file:path=hi.txt
-        if ":" in name:
-            name, first_arg = name.split(":", 1)
-            parts = [first_arg] + parts[1:]
-        else:
-            parts = parts[1:]
-
+        rest = parts[1] if len(parts) > 1 else ""
         tool_args = {}
-        current_key = None
-        for token in parts:
-            if "=" in token:
-                key, value = token.split("=", 1)
-                current_key = key
-                tool_args[key] = value
-            elif current_key is not None:
-                tool_args[current_key] += " " + token
+        if not rest:
+            return name, tool_args
+        # Find key=value or key="..." or key='...'
+        pattern = _re.compile(r'(\w+?)\s*=\s*("[^"]*"|\'[^\']*\'|\S+)')
+        for key, val in pattern.findall(rest):
+            if val.startswith('"') and val.endswith('"'):
+                val = val[1:-1]
+            elif val.startswith("'") and val.endswith("'"):
+                val = val[1:-1]
+            tool_args[key] = val
         return name, tool_args
 
     def _handle_slash_command(self, user_input: str) -> bool:
@@ -919,12 +1299,19 @@ class Companion:
             help_lines = [
                 "commands:",
                 "  /time              show current time",
+                "  /read <path>       read a file",
+                "  /write <path> <content> write a file",
+                "  /edit <path>       edit a file",
+                "  /list [path]       list files",
                 "  /tool <args>       run a tool manually",
                 "  /exec <command>    shortcut for /tool execute_command command=<cmd>",
                 "  /mood <mood>       force a mood",
+                "  /persona [name]    switch personality preset",
                 "  /prank [type]      do a prank (mouse, window, volume, clipboard, rickroll)",
                 "  /teach <topic>     open ChatGPT temporary chat to explain a topic",
                 "  /spam              toggle keyboard-spam filter",
+                "  /memory            show what Mira remembers",
+                "  /status            show Mira's current status",
                 "  /kill              end session",
                 "  /help              show this help",
                 "",
@@ -960,12 +1347,58 @@ class Companion:
             self._chat_message(None, f"spam filter {status}")
             return True
 
+        if cmd == "/memory":
+            facts = self.memory.all_facts()[-10:]
+            events = self.memory.recent_events(10)
+            self._chat_message(None, f"last {len(facts)} facts:")
+            for fact in facts:
+                self._chat_message(None, f"  - {fact}")
+            self._chat_message(None, f"last {len(events)} events:")
+            for ev in events:
+                self._chat_message(None, f"  - {ev.get('event_type')}: {ev.get('detail')}")
+            return True
+
+        if cmd == "/status":
+            moods_row = ", ".join(self.personality.MOODS)
+            status_lines = [
+                f"mood: {self.personality.mood} (confidence: {self.personality.mood_confidence:.2f})",
+                f"patience: {self.personality.patience:.0%}",
+                f"active preset: {self.personality.active_preset}",
+            ]
+            grudge = self.memory.get_grudge_summary()
+            if grudge:
+                status_lines.append(f"memory: {grudge}")
+            recent_events = self.memory.recent_events(3)
+            if recent_events:
+                status_lines.append("recent events:")
+                for ev in recent_events:
+                    status_lines.append(f"  - {ev.get('event_type')}: {ev.get('detail')}")
+            for line in status_lines:
+                self._chat_message(None, line)
+            return True
+
+        if cmd == "/persona":
+            if not args:
+                presets = ", ".join(self.personality.presets.keys())
+                self._chat_message(None, f"active: {self.personality.active_preset}. available: {presets}")
+                return True
+            preset_name = args.strip()
+            if self.personality.switch_preset(preset_name):
+                self._chat_message(None, f"switched to persona {preset_name}")
+            else:
+                available = ", ".join(self.personality.presets.keys())
+                self._chat_message(None, f"unknown persona. available: {available}")
+            return True
+
         if cmd == "/kill":
             self._chat_message(None, "ending session")
             self.running = False
             return True
 
         if cmd == "/exec":
+            if self.personality.mood in ("angry", "sad"):
+                self._chat_message(self.personality.name, "nah im not helpin u rn. comfort me first or apologize.")
+                return True
             if not args:
                 self._chat_message(None, "usage: /exec <command>")
                 return True
@@ -974,6 +1407,9 @@ class Companion:
             return True
 
         if cmd == "/teach":
+            if self.personality.mood in ("angry", "sad"):
+                self._chat_message(self.personality.name, "nah im not helpin u rn. comfort me first or apologize.")
+                return True
             if not args:
                 self._chat_message(None, "usage: /teach <topic>")
                 return True
@@ -985,15 +1421,64 @@ class Companion:
             return True
 
         if cmd == "/prank":
-            # Pranks are refused in sad or angry moods.
+            # Pranks are allowed when happy, refused in sad or angry moods.
             if self.personality.mood in ("sad", "angry"):
                 self._chat_message(None, "prank refused")
+                return True
+            if self.personality.mood != "happy":
+                self._chat_message(None, "not in the mood for pranks")
                 return True
             result = self._do_prank(args.lower() if args else None)
             self._chat_message(None, f"pranked: {result}")
             return True
 
+        if cmd == "/read":
+            if not args:
+                self._chat_message(None, "usage: /read <path>")
+                return True
+            result = self.tools.execute("read_file", {"path": args.strip()})
+            self._chat_message(None, result)
+            return True
+
+        if cmd == "/write":
+            if not args:
+                self._chat_message(None, "usage: /write <path> <content>")
+                return True
+            # Format: /write path=... content=...
+            try:
+                parts = args.split(" ", 1)
+                path = parts[0]
+                content = parts[1] if len(parts) > 1 else ""
+                result = self.tools.execute("write_file", {"path": path, "content": content})
+                self._chat_message(None, result)
+            except Exception as e:
+                self._chat_message(None, f"write failed: {e}")
+            return True
+
+        if cmd == "/edit":
+            if not args:
+                self._chat_message(None, "usage: /edit <path> <instructions>")
+                return True
+            try:
+                parts = args.split(" ", 1)
+                path = parts[0]
+                instruction = parts[1] if len(parts) > 1 else ""
+                result = self.tools.execute("read_file", {"path": path})
+                self._chat_message(None, f"editing {path}: {instruction}")
+            except Exception as e:
+                self._chat_message(None, f"edit failed: {e}")
+            return True
+
+        if cmd == "/list":
+            path = args.strip() if args else ""
+            result = self.tools.execute("list_files", {"path": path} if path else {})
+            self._chat_message(None, result)
+            return True
+
         if cmd in ("/tool", "/tools"):
+            if self.personality.mood in ("angry", "sad"):
+                self._chat_message(self.personality.name, "nah im not helpin u rn. comfort me first or apologize.")
+                return True
             if not args:
                 self._chat_message(None, "usage: /tool <tool_name> [key=value ...] or /tool name:key=value|key=value")
                 return True
@@ -1014,7 +1499,18 @@ class Companion:
                 self.personality.set_mood(mood, force=True)
                 self._chat_message(None, f"mood set to {mood}")
             else:
-                self._chat_message(None, f"unknown mood. valid: {', '.join(self.personality.MOODS)}")
+                self._chat_message(None, "unknown mood. valid:")
+                width = self.ui.screen_width - 4 if self.ui and self.ui.screen_width > 20 else 80
+                line = ""
+                for m in self.personality.MOODS:
+                    candidate = (line + ", " if line else "") + m
+                    if line and len(candidate) > width:
+                        self._chat_message(None, line)
+                        line = m
+                    else:
+                        line = candidate
+                if line:
+                    self._chat_message(None, line)
             return True
 
         self._chat_message(None, f"unknown command: {cmd}")
@@ -1029,19 +1525,19 @@ class Companion:
         collapsed = " ".join(str(text).split()).strip()
         if not collapsed:
             return
+        timestamp = datetime.now().strftime("%H:%M")
         if sender == self.personality.name:
-            self.chat_lines.append((sender, collapsed, self.personality.mood))
+            self.chat_lines.append((sender, collapsed, timestamp, self.personality.mood))
             # Keep a short list of recent replies to avoid repeating them
             self.last_replies.append(collapsed)
             self.last_replies = self.last_replies[-5:]
         else:
-            self.chat_lines.append((sender, collapsed))
+            self.chat_lines.append((sender, collapsed, timestamp, None))
 
     def _ui_state(self):
         mode = self.typing_state if self.typing_state else "idle"
         return {
             "mood": self.personality.mood,
-            "energy": self.personality.energy,
             "patience": self.personality.patience,
             "chat_lines": self.chat_lines,
             "input_buffer": self.input_buffer,
@@ -1054,10 +1550,16 @@ class Companion:
     def _mira_worker(self):
         while self.running:
             try:
-                user_input = self.user_queue.get(timeout=0.5)
+                item = self.user_queue.get(timeout=0.5)
             except Empty:
                 continue
             self.last_user_time = time.time()
+
+            # Unpack (input, narrator_context) tuple; old strings still supported
+            if isinstance(item, tuple):
+                user_input, tag_context = item
+            else:
+                user_input, tag_context = item, ""
 
             self.typing_state = "typing"
             time.sleep(random.uniform(0.05, 0.1))
@@ -1065,7 +1567,7 @@ class Companion:
             self.typing_state = "thinking"
             messages = []
             try:
-                messages = self.respond(user_input)
+                messages = self.respond(user_input, context=tag_context or None)
             except RuntimeError:
                 self.mira_queue.put((None, "_close_terminal"))
                 return
@@ -1105,10 +1607,10 @@ class Companion:
                 self.last_user_time = time.time()
                 continue
 
-            self.personality.recover_energy_idle(0.01)
+            self.personality.recover_patience_idle(0.01)
 
-            # Auto-prank when mischievous, every 15-20 minutes.
-            if self.personality.mood == "mischievous" and self.next_prank_time and time.time() >= self.next_prank_time:
+            # Auto-prank when happy, every 15-20 minutes.
+            if self.personality.mood == "happy" and self.next_prank_time and time.time() >= self.next_prank_time:
                 try:
                     result = self._do_prank()
                     self.mira_queue.put((None, f"pranked: {result}"))
@@ -1128,25 +1630,41 @@ class Companion:
 
             if self.personality.mood == "angry" and elapsed > 600:
                 if random.random() < 0.3:
-                    self.mira_queue.put((self.personality.name, random.choice([
-                        "u ghosted me... fine. im out.", "im done waiting"
-                    ])))
+                    prompt = (
+                        "Mira is angry and has been ignored. "
+                        "Generate a short 'im leaving' message in her voice. Start with [emotion]."
+                    )
+                    reply = self.llm.generate_text(prompt=prompt)
+                    reply = self.llm.clean_reply(reply) if reply else "im done waiting"
+                    self.mira_queue.put((self.personality.name, reply))
                     self.mira_queue.put((None, "_close_terminal"))
                     return
 
             if self.personality.mood == "angry" and elapsed > 180:
                 if random.random() < 0.1:
-                    self.mira_queue.put((self.personality.name, random.choice([
-                        "wow ok ignore me", ":/", "u suck", "im done waiting"
-                    ])))
+                    prompt = (
+                        "Mira is angry and feels ignored. "
+                        "Generate a short, snappy message. Start with [emotion]."
+                    )
+                    reply = self.llm.generate_text(prompt=prompt)
+                    reply = self.llm.clean_reply(reply) if reply else "wow ok ignore me"
+                    self.mira_queue.put((self.personality.name, reply))
             elif elapsed > 1200:
                 if random.random() < 0.1:
-                    self.mira_queue.put((self.personality.name, random.choice([
-                        "u still there?", "hello?", "...", "u alive?"
-                    ])))
+                    prompt = (
+                        "Mira has been left alone. "
+                        "Generate a short message checking if the user is still there. Start with [emotion]."
+                    )
+                    reply = self.llm.generate_text(prompt=prompt)
+                    reply = self.llm.clean_reply(reply) if reply else "u still there?"
+                    self.mira_queue.put((self.personality.name, reply))
 
     def _close_terminal(self):
         self.exit_message = "Mira got fed up and shut down"
+        try:
+            self.memory.log_event("shutdown", self.exit_message, severity=2.0)
+        except Exception:
+            pass
         self.running = False
 
     def _flush_batch(self):
@@ -1154,9 +1672,11 @@ class Companion:
             self.batch_deadline = None
             return
         combined = " ".join(self.pending_batch)
+        tag_context = "\n".join(self.pending_tag_context)
         self.pending_batch = []
+        self.pending_tag_context = []
         self.batch_deadline = None
-        self.user_queue.put(combined)
+        self.user_queue.put((combined, tag_context))
 
     # ── Run ─────────────────────────────────────────────────────────────────
 
@@ -1268,18 +1788,54 @@ class Companion:
                             self.input_buffer = ""
                             self.ui.draw_input("")
 
+                            # Burst detection
+                            now = time.time()
+                            if now - self.last_user_input_time <= self.burst_window:
+                                self.burst_count += 1
+                            else:
+                                self.burst_count = 1
+                            self.last_user_input_time = now
+
+                            if self.burst_count >= self.burst_threshold:
+                                if self.spam_filter_enabled:
+                                    self._chat_message(None, "spam burst detected, ignored")
+                                    continue
+                                # If spam filter off, still warn once then process latest only
+                                if self.burst_count == self.burst_threshold:
+                                    self._chat_message(self.personality.name, "bruh stop spamming")
+                                continue
+
                             # Detect accidental keyboard/code spam
                             if self.spam_filter_enabled and self._is_spam_input(user_input):
                                 self._chat_message(None, "keyboard spam detected, ignored")
                                 continue
 
-                            if user_input.startswith("/"):
-                                if self._handle_slash_command(user_input):
+                            clean_input, tag_context = self._extract_narrator_tags(user_input)
+                            clean_input = self._normalize_input(clean_input)
+
+                            now = time.time()
+                            if clean_input == self.last_user_text and now - self.last_user_time < self.repeat_window:
+                                self.repeat_count += 1
+                                if self.repeat_count == 3:
+                                    self.mira_queue.put((self.personality.name, "stop repeating."))
+                                continue
+                            else:
+                                self.repeat_count = 0
+                                self.last_user_text = clean_input
+                                self.last_user_time = now
+
+                            if clean_input.startswith("/"):
+                                if self._handle_slash_command(clean_input):
                                     continue
 
-                            self._chat_message("You", user_input)
-                            self.pending_batch.append(user_input)
-                            self.batch_deadline = time.time() + self.batch_delay
+                            self._chat_message("You", clean_input)
+                            self.pending_batch.append(clean_input)
+                            if tag_context:
+                                self.pending_tag_context.append(tag_context)
+                            if self.batch_delay <= 0:
+                                self._flush_batch()
+                            else:
+                                self.batch_deadline = time.time() + self.batch_delay
 
                     elif ch in (127, curses.KEY_BACKSPACE, 263):
                         self.input_buffer = self.input_buffer[:-1]
@@ -1311,7 +1867,7 @@ class Companion:
         while True:
             try:
                 state = self.personality.state()
-                print(f"\n{state['mood']} | energy {state['energy']:.0%} | patience {state['patience']:.0%} | {datetime.now().strftime('%H:%M')}")
+                print(f"\n{state['mood']} | patience {state['patience']:.0%} | {datetime.now().strftime('%H:%M')}")
                 user_input = input("you > ").strip()
                 if not user_input:
                     continue
@@ -1340,4 +1896,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except RuntimeError as e:
+        print(f"\nMira: {e}")
+        raise SystemExit(0)
