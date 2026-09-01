@@ -66,7 +66,7 @@ The header looks like this:
 
 - **Terminal chat** — Talk to Mira inside a curses terminal UI.
 - **Personality** — Casual, sometimes snarky, sometimes caring. Short replies, slang, text emojis.
-- **Moods** — normal, happy, curious, mischievous, annoyed, angry, sad.
+- **Moods** — calm, happy, sad, angry, excited, tired, bored, curious (simple emotion words).
 - **Patience** — Mira's tolerance meter. Insults drain it; friendly chat and idle time recover it.
 - **Memory** — Remembers facts you tell her across sessions.
 - **Tool loop** — Mira can call tools through function calling and react to the results.
@@ -95,7 +95,7 @@ The header looks like this:
 
 `/exec <command>` is a shortcut for `/tool execute_command command=<command>`.
 
-Tools include: `time, write_file, read_file, edit_file, delete_file, list_files, execute_command, open_file, open_website, web_search, read_website, system_info, open_app, close_app, toggle_wifi, toggle_airdrop, notify, type_text, press_key, get_volume, set_volume, move_mouse, shake_mouse, click_mouse, get_mouse_position, get_clipboard, set_clipboard, close_front_window, minimize_front_window, resize_window, ask_chatgpt.`
+Tools include: `time, write_file, read_file, edit_file, delete_file, list_files, execute_command, open_file, open_website, web_search, read_website, system_info, open_app, close_app, toggle_wifi, toggle_airdrop, notify, type_text, press_key, get_volume, set_volume, move_mouse, shake_mouse, click_mouse, get_mouse_position, get_clipboard, set_clipboard, close_front_window, minimize_front_window, resize_window, ask_chatgpt, say, screenshot, search_web, search_files.`
 ---
 
 ## How Moods Work
@@ -133,28 +133,69 @@ No other keyword triggers mood changes.
 
 ```
 MIRA/
-├── main.py        # Main chat loop, UI, and session logic
-├── llm.py         # LLM prompt building and API communication
-├── personality.py # Mood and patience management
-├── memory.py      # Long-term memory and conversation log
-├── tools.py       # Computer interaction tools
-├── config.json    # Personality traits, thresholds, and settings
-├── memory/        # Stored facts, session state, and chat log
-├── .env           # Your API key (not committed to git)
-└── .gitignore     # Prevents .env and memory files from being pushed
+├── main.py            # Entry point
+├── brain/
+│   ├── core.py        # Chat loop, intent detection, pranks, slash commands
+│   ├── llm.py         # LLM API communication and prompt building
+│   ├── personality.py # Mood and patience management
+│   ├── memory.py      # Long-term memory and conversation log
+│   ├── tools.py       # Declarative tool registry + computer interaction
+│   └── terminal.py    # Curses terminal UI
+├── config.json        # Personality traits, thresholds, and settings
+├── memory/            # Stored facts, session state, and chat log
+├── .env               # Your API key (not committed to git)
+└── .gitignore         # Prevents .env and memory files from being pushed
 ```
 
 ---
 
 ## What Changed in v26.3.1-PRE
 
-Emotion overhaul, memory improvements, and tool personality.
+### Cleanup & refactor
+- **Declarative tool registry** — `tools.py` tool definitions collapsed into a compact table (~230 lines saved).
+- **Removed dead code** — `_extract_mira_tags`, `_extract_edit_path`, `_mood_voice`, `EMOTION_CATEGORIES`, `summarize_session`, `clear_interactions`, `short_term` storage, `events_of_type`, and the unused `mood_classifier`/`chaos` config.
+- **Unified prompt builders** — `build_prompt`/`build_messages` now share one context assembler.
+- **Single source of truth** — moods defined once in `personality.MOODS`; hardcoded `/Users/derek` paths replaced with `Path.home()`.
+
+### Emotional overhaul
+- **No more per-message LLM call** — intent detection is now fast, deterministic keyword + fuzzy matching (insult intensity + apology detection).
+- **Patience rebalanced** — friendly chat now *recovers* patience instead of slowly draining it; insults drain it. One clean `adjust`/`annoy`/`comfort` API.
+- **Mood drift wired up** — the previously-dead `mood_drift` config now makes her drift moods when idle.
+- **Fact dedup** — repeated facts are no longer stored twice.
+
+### New features
+- **`say` tool** — Mira speaks out loud via macOS text-to-speech.
+- **`screenshot` tool** — captures the screen to `~/Desktop/MiraFiles/`.
+- **`/mood history`** — bar chart of her recent moods.
+- **`/forget <fact>`** — delete a specific fact she remembers.
+- **`/relationship`** — show trust/closeness/frustration stats.
+- **Session summarization** — on exit she summarizes the conversation and remembers it next boot.
+
+### Real memory
+- **LLM fact extraction** — messages that look like they contain personal info are scanned by the LLM (in the background) for durable facts, on top of the fast regex path. She now remembers things like "Derek's cat is named Mochi" instead of just "my name is X".
+- **Semantic recall** — ask "what did I say about my job?" or "do you remember my cat?" and she searches her facts + past messages (with synonym matching **and** character n-gram similarity) and answers with what you actually said.
+- **Fact dedup** — repeated facts are no longer stored twice.
+
+### Evolving relationship
+- **Trust / closeness / frustration** now persist and change with how you treat her: insults drop trust and raise frustration, apologies recover both, and friendly chat slowly builds trust and closeness.
+- The relationship level is injected into her system prompt, so she's warm and open at high trust, guarded and cold at low trust.
+- **Milestones** — she knows how long she's known you and how many times she's forgiven you.
+
+### Personality system
+- **Traits are now real** — `sarcasm`, `chaos`, `affection`, `grouchiness`, `curiosity`, `stubbornness`, `helpfulness` (0-1 in config) are injected into her system prompt, so they actually change how she talks.
+- **Personality editor** — `/persona show`, `/persona list`, `/persona new <name>`, `/persona apply <name>`, `/persona set <trait> <0-1>`, `/persona voice <text>`, `/persona delete <name>`, `/persona reset`. Presets with their own name/voice/traits persist in config.json.
+
+### Context intelligence
+- **User mood detection** — she reads *your* emotional state (stressed, sad, happy, angry, tired) and adjusts her tone; "im stressed" gets a gentle reassuring reply.
+- **Time-aware** — she acts differently at 2am vs 9am (groggy in the morning, chatty at night).
+- **Pattern recognition** — she notices when you usually talk to her ("you always message me around 19:00").
+- **`/undo`** — revert her last file write (she snapshots files before writing them).
+- **Config-driven settings** — prank interval, repeat threshold, and mood cooldown now live in `config.json` under `settings` instead of being hardcoded.
 
 ### Emotions
-- Reduced to **6 core emotions**: calm, happy, scared, angry, confused, sad.
+- Reduced to **8 simple core emotions**: calm, happy, sad, angry, excited, tired, bored, curious.
 - Every reply starts with an emotion tag like `[happy]` or `[angry]`.
 - The LLM's chosen emotion tag drives Mira's mood, so what she says matches how she feels.
-- Emotion confidence and mood memory keep her from jumping around randomly.
 - Boot coldness: after a shutdown she starts annoyed/angry instead of friendly.
 
 ### Memory
@@ -189,9 +230,22 @@ Emotion overhaul, memory improvements, and tool personality.
 
 ---
 
+## Pi Integration
+
+Mira now has real coding-agent capabilities (like the Pi coding agent), kept in `brain/pi.py` and registered as normal tools so she can call them through the tool loop — all while keeping her personality.
+
+- **`search_web`** — real web search that returns actual result summaries (titles, cleaned URLs, snippets) via Bing, instead of just opening a browser tab. No API key needed.
+- **`search_files`** — grep-style search for text/regex across a directory, so she can find code and text in your projects.
+- **`search_chat_history`** — search Mira's own past conversations.
+- **`search_hermes_memory`** — search the pi agent's durable memory files (same long-term memory the coding agent keeps).
+
+Example: ask "use search_files to find where respond_stream is defined" and she greps the codebase and tells you the file + line.
+
+The `pi/` folder at the repo root holds the Pi agent's own data (memory, skills, sessions) and is left untouched.
+
 ## Notes
 
-- V26.3.1-PRE is a pre-release focused on the 6-emotion overhaul and memory improvements.
+- Mira now uses 8 simple core emotions: calm, happy, sad, angry, excited, tired, bored, curious.
 - Mira boots up in `calm` mood with full patience.
 - The `.env` file and `memory/` folder are ignored by Git so your API key and chat data stay private.
 - Mira is still under development.

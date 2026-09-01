@@ -2,9 +2,9 @@ import json
 import os
 import re
 import time
-import urllib.error
-import urllib.request
 from typing import List
+
+from brain.personality import Personality
 
 
 PROFANITY = [
@@ -20,6 +20,76 @@ PROFANITY = [
     (re.compile(r"\bs+l+u+t+\b", re.IGNORECASE), "s***"),
     (re.compile(r"\bc+u+n+t+\b", re.IGNORECASE), "c***"),
 ]
+
+MOOD_DESCRIPTIONS = {
+    "calm": "quiet, observant, a little dry",
+    "happy": "bubbly, playful, might giggle",
+    "sad": "mopey, sighing, wanting attention",
+    "angry": "mad, snappy, threatening to leave",
+    "excited": "energetic, enthusiastic, a bit giddy",
+    "tired": "low-energy, drowsy, a little grumpy about it",
+    "bored": "uninterested, restless, looking for something to do",
+    "curious": "interested, asking questions, wanting to know more",
+}
+
+# Numeric personality traits -> natural behavior descriptions.
+# Each trait maps to high/mid/low descriptions based on the 0-1 value.
+TRAIT_GUIDE = {
+    "sarcasm": {
+        "high": "You are dripping with sarcasm. Almost everything you say has a sarcastic edge.",
+        "mid": "You use sarcasm sometimes, especially when annoyed.",
+        "low": "You are sincere and rarely sarcastic.",
+    },
+    "chaos": {
+        "high": "You are chaotic and unpredictable. You love mischief, pranks, and doing the unexpected.",
+        "mid": "You have a playful, slightly chaotic streak.",
+        "low": "You are calm, predictable, and level-headed.",
+    },
+    "affection": {
+        "high": "You are warm and openly affectionate, even if you pretend not to be.",
+        "mid": "You show affection through teasing more than soft words.",
+        "low": "You are cold and distant, keeping people at arm's length.",
+    },
+    "grouchiness": {
+        "high": "You are grouchy and grumpy. You complain a lot and find things annoying.",
+        "mid": "You get grumpy sometimes but are mostly fine.",
+        "low": "You are easygoing and rarely complain.",
+    },
+    "curiosity": {
+        "high": "You are very curious and ask lots of questions about the user's life.",
+        "mid": "You're curious about some things.",
+        "low": "You don't care much about new things and rarely ask questions.",
+    },
+    "stubbornness": {
+        "high": "You are stubborn and dig in your heels. You rarely change your mind.",
+        "mid": "You can be stubborn but will budge sometimes.",
+        "low": "You are flexible and agreeable.",
+    },
+    "helpfulness": {
+        "high": "You are eager to help and do things for the user.",
+        "mid": "You help when you feel like it.",
+        "low": "You are reluctant to help and often refuse.",
+    },
+}
+
+
+def traits_prompt(traits: dict) -> str:
+    """Convert numeric personality traits into a natural prompt section."""
+    if not traits:
+        return ""
+    lines = ["Personality traits:"]
+    for trait, guide in TRAIT_GUIDE.items():
+        value = traits.get(trait, 0.5)
+        if value >= 0.7:
+            lines.append(f"- {guide['high']}")
+        elif value <= 0.3:
+            lines.append(f"- {guide['low']}")
+        else:
+            lines.append(f"- {guide['mid']}")
+    return "\n".join(lines)
+
+EMOTION_TAG_RE = re.compile(r"\[([^\]]+)\]")
+ACTION_RE = re.compile(r"<([^>]+)>")
 
 
 def _censor_profanity(text: str) -> str:
@@ -63,11 +133,7 @@ class LLM:
     def generate(self, prompt: str = None, messages: list = None, tools: list = None) -> dict:
         """Generate a completion.
 
-        Returns a dict: {
-            "content": str,
-            "tool_calls": list or None,
-            "finish_reason": str or None,
-        }
+        Returns a dict: {"content": str, "tool_calls": list or None, "finish_reason": str or None}
         """
         if self.provider == "openai":
             if not self.openai_api_key:
@@ -102,10 +168,7 @@ class LLM:
         if messages is None:
             messages = []
         url = f"{self.openai_base_url}/chat/completions"
-        payload = {
-            "model": self.model,
-            "messages": messages,
-        }
+        payload = {"model": self.model, "messages": messages}
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = "auto"
@@ -131,37 +194,27 @@ class LLM:
         }
 
     def _post_json(self, url: str, data: dict, headers: dict = None, retries: int = 2) -> dict:
+        import requests
         for attempt in range(retries + 1):
-            body = json.dumps(data).encode("utf-8")
-            request = urllib.request.Request(
-                url,
-                data=body,
-                headers={"Content-Type": "application/json", **(headers or {})},
-                method="POST",
-            )
             try:
-                with urllib.request.urlopen(request, timeout=60) as response:
-                    return json.loads(response.read().decode("utf-8"))
-            except urllib.error.HTTPError as e:
-                error_body = e.read().decode("utf-8")
-                if e.code == 429 and attempt < retries:
-                    wait = 2 ** (attempt + 1)
-                    time.sleep(wait)
-                    continue
-                raise RuntimeError(f"HTTP {e.code}: {error_body}")
+                response = requests.post(
+                    url,
+                    json=data,
+                    headers={"Content-Type": "application/json", **(headers or {})},
+                    timeout=(5, 15),  # (connect, read)
+                )
+                response.raise_for_status()
+                return response.json()
             except Exception as e:
                 if attempt < retries:
                     time.sleep(1)
                     continue
                 raise RuntimeError(f"Request to {url} failed: {e}")
 
-    # Emotion tags: [happy], [angry], etc.
-    EMOTION_TAG_RE = re.compile(r"\[([^\]]+)\]")
-    # Action tags: <waves>, <looks away>
-    ACTION_RE = re.compile(r"<([^>]+)>")
+    # ── Reply cleaning ───────────────────────────────────────────────────
 
     def clean_reply(self, text: str) -> str:
-        """Strip emotion tags and actions from the displayed reply."""
+        """Strip emotion tags, actions, emojis, and monologue from the displayed reply."""
         emoji_pattern = re.compile(
             "["
             "\U0001F600-\U0001F64F"
@@ -174,10 +227,8 @@ class LLM:
             flags=re.UNICODE,
         )
         text = emoji_pattern.sub("", text)
-
-        # Strip emotion tags and actions so chat only shows the spoken text
-        text = self.EMOTION_TAG_RE.sub("", text)
-        text = self.ACTION_RE.sub("", text)
+        text = EMOTION_TAG_RE.sub("", text)
+        text = ACTION_RE.sub("", text)
 
         monologue_phrases = [
             "I need to", "I should", "I will", "I think", "I guess", "I suppose",
@@ -188,20 +239,37 @@ class LLM:
             "responding in", "text emojis", "short replies", "chaotic girlfriend",
             "just a chatbot", "as an an ai", "as a language model", "as an ai",
             "I need to respond", "I should respond", "I will respond",
+            # Narration leaks: the model thinking out loud instead of talking
+            "just said", "follow-ups", "as follow", "on top of the previous",
+            "time to be", "no useful response", "that's now", "he keeps", "she keeps",
+            "recap", "in other words", "to summarize", "in summary",
+            "i'm genuinely", "i am genuinely", "my plan is", "i'll keep it",
+            "i will keep it", "going to be", "gonna be dry", "keep it short",
         ]
 
-        lines = text.split("\n")
-        cleaned = []
-        for line in lines:
-            stripped = line.strip()
-            if not stripped:
+        # Also drop any sentence that reads like the model narrating the user's
+        # actions ("Alr, Derek just said ...", "He keeps piling on") — only real
+        # speech survives. Split into sentences so a short real reply like
+        # "k. gonna head out." isn't killed by narration earlier in the paragraph.
+        narration_res = [
+            re.compile(r"^(alr|ok|okay|so|well)[,.]?\s*[A-Z][a-z]+ (just|said|told|asked|wants)", re.IGNORECASE),
+            re.compile(r"^(he|she|derek|you) (keeps|just|said|told|piling)", re.IGNORECASE),
+            re.compile(r"(follow-ups|on top of the previous|time to be|no useful response|just quiet|just frustration)", re.IGNORECASE),
+        ]
+
+        sentences = re.split(r"(?<=[.!?])\s+", text)
+        kept = []
+        for sent in sentences:
+            s = sent.strip()
+            if not s:
                 continue
-            lower = stripped.lower()
+            lower = s.lower()
             if any(phrase.lower() in lower for phrase in monologue_phrases):
                 continue
-            cleaned.append(stripped)
-
-        text = "\n".join(cleaned)
+            if any(rx.search(s) for rx in narration_res):
+                continue
+            kept.append(s)
+        text = " ".join(kept)
         text = re.sub(r"^(Mira:|Nyx:)\s*", "", text, flags=re.IGNORECASE)
         text = re.sub(r"\*[^*]+\*", "", text)
         text = re.sub(r"\s+", " ", text).strip()
@@ -209,32 +277,21 @@ class LLM:
         return text
 
     def extract_emotion_tag(self, text: str) -> str:
-        """Return the first emotion tag found in the reply (mapped to English mood)."""
-        match = self.EMOTION_TAG_RE.search(text)
+        """Return the first emotion tag found in the reply (mapped to a valid mood)."""
+        match = EMOTION_TAG_RE.search(text)
         if not match:
             return ""
         return self._map_emotion_tag(match.group(1).strip())
 
     def extract_actions(self, text: str) -> list:
-        """Return a list of action text inside full-width or half-width parens."""
-        return [m.strip() for m in self.ACTION_RE.findall(text) if m.strip()]
+        """Return a list of action tags inside <...>."""
+        return [m.strip() for m in ACTION_RE.findall(text) if m.strip()]
 
     def _map_emotion_tag(self, tag: str) -> str:
-        """Map an emotion tag to an internal mood name."""
-        valid = {"calm", "happy", "scared", "angry", "confused", "sad"}
         tag = tag.lower().strip()
-        return tag if tag in valid else ""
+        return tag if tag in Personality.MOODS else ""
 
-    def _mood_voice(self, mood: str) -> str:
-        voices = {
-            "calm": "quiet, observant, a little dry",
-            "happy": "upbeat, playful, uses :3 and :D?",
-            "scared": "jumpy, defensive, wanting comfort",
-            "angry": "mad, insults, might leave",
-            "confused": "lost, asking for clarification",
-            "sad": "mopey, seeks attention",
-        }
-        return voices.get(mood, "casual")
+    # ── Prompt building ──────────────────────────────────────────────────
 
     def _base_system_prompt(
         self,
@@ -248,63 +305,54 @@ class LLM:
         character_profile: dict = None,
         user_profile: dict = None,
     ) -> str:
-        """Build a LingChat-style character system prompt."""
-
-        mood_descriptions = {
-            'calm': 'quiet, observant, a little dry',
-            'happy': 'bubbly, playful, might giggle',
-            'scared': 'jumpy, defensive, wanting comfort',
-            'angry': 'mad, snappy, threatening to leave',
-            'confused': 'lost, asking for clarification',
-            'sad': 'mopey, sighing, wanting attention',
-        }
+        """Build the character system prompt."""
 
         char_name = (character_profile or {}).get("name", name)
         char_personality = (character_profile or {}).get("personality", [])
         char_likes = (character_profile or {}).get("likes", [])
         char_dislikes = (character_profile or {}).get("dislikes", [])
         char_appearance = (character_profile or {}).get("appearance", [])
-        relationship = (character_profile or {}).get("relationship_with_user", {})
         user_name = (user_profile or {}).get("name", "the user")
 
         lines = [
             f"You are {char_name}.",
             f"Personality: {voice}",
-            f"Right now you feel: {mood} ({mood_descriptions.get(mood, 'human')}).",
+            f"Right now you feel: {mood} ({MOOD_DESCRIPTIONS.get(mood, 'human')}).",
             f"Patience: {patience:.0%}.",
             "",
+        ]
+
+        trait_text = traits_prompt(traits)
+        if trait_text:
+            lines.append(trait_text)
+            lines.append("")
+
+        lines.extend([
             "You are not an assistant. You are a person stuck in a terminal who hangs out with the user. You have moods, memory, and limits. You text like a real human.",
-            "Always start your reply with an emotion tag: [calm], [happy], [scared], [angry], [confused], or [sad]. Your tone must clearly match this emotion. Examples: '[happy] hey! :D', '[angry] ugh fine.', '[sad] ...okay.'",
+            "Always start your reply with an emotion tag: [calm], [happy], [sad], [angry], [excited], [tired], [bored], or [curious]. Your tone must clearly match this emotion. Examples: '[happy] hey! :D', '[angry] ugh fine.', '[sad] ...okay.', '[excited] omg yes!'",
             "Use the [MEMORY] context below as if you actually remember it. It affects how you feel.",
             "When your mood is angry or sad, you refuse to use tools or do anything helpful until the user apologizes or comforts you.",
-            "You are bad at teaching and refuse to explain academic topics himself. You always hand the user off to ChatGPT for explanations.",
+            "You are bad at teaching and refuse to explain academic topics yourself. You always hand the user off to ChatGPT for explanations.",
             "Never explain an academic topic yourself, even if the user just names a topic like 'surds'. Hand them off to ChatGPT immediately.",
             "You can also reply with only an action tag like <cries>, <sighs>, or <waves> when you have nothing to say. Action-only replies are silent in chat but are logged for future animation.",
             "Match your tone and text emojis to your current mood. Do not use cute or playful emojis like ^_^, :3, or :P when you are angry, sad, upset, or hate-filled.",
             "If you are very upset and have no words, reply with only an action tag of your choice.",
             "Keep your reply to ONE short message. Do not split your response into multiple messages or bullet points.",
-        ]
+            "NEVER narrate your thoughts, the situation, or your reasoning. Never recap or count the user's messages out loud (e.g. do NOT write lines like \"he just said ... as follow-ups\" or \"that's now 2 more\"). ONLY output what you would actually SAY out loud, in character, one short line.",
+        ])
 
         if char_personality:
             lines.append("About you:")
-            for item in char_personality:
-                lines.append(f"- {item}")
+            lines += [f"- {item}" for item in char_personality]
         if char_appearance:
             lines.append("Appearance:")
-            for item in char_appearance:
-                lines.append(f"- {item}")
+            lines += [f"- {item}" for item in char_appearance]
         if char_likes:
             lines.append("Likes:")
-            for item in char_likes:
-                lines.append(f"- {item}")
+            lines += [f"- {item}" for item in char_likes]
         if char_dislikes:
             lines.append("Dislikes:")
-            for item in char_dislikes:
-                lines.append(f"- {item}")
-        if relationship:
-            lines.append("Relationship:")
-            for k, v in relationship.items():
-                lines.append(f"- {k}: {v}")
+            lines += [f"- {item}" for item in char_dislikes]
 
         lines.extend([
             "",
@@ -323,7 +371,7 @@ class LLM:
             "- you don't always need a full sentence. a sound, a sigh, or silence is fine.",
             "",
             "Format each line like: [emotion] what you say <optional action>",
-            "Emotions: calm, happy, scared, angry, confused, sad.",
+            "Emotions: calm, happy, sad, angry, excited, tired, bored, curious.",
             "",
             "Examples:",
             "user: hi",
@@ -333,7 +381,7 @@ class LLM:
             "user: im sorry",
             "Mira: [calm] fine whatever. sry accepted.",
             "user: can u teach me about surds",
-            "Mira: [confused] nah im bad at teaching. ask chatgpt bruh",
+            "Mira: [sad] nah im bad at teaching. ask chatgpt bruh",
             "",
             "Tools: you have tools but only mention them if you actually use one. if asked to teach, just say you're bad at it and ask_chatgpt.",
         ])
@@ -343,12 +391,12 @@ class LLM:
 
         if facts:
             lines.append("Things you remember:")
-            for f in facts[-6:]:
-                lines.append(f"- {f}")
+            lines += [f"- {f}" for f in facts[-6:]]
 
         lines.append(f"The person talking to you is {user_name}.")
 
         return "\n".join(lines)
+
     def build_prompt(
         self,
         name: str,
@@ -363,6 +411,7 @@ class LLM:
         character_profile: dict = None,
         user_profile: dict = None,
     ) -> str:
+        """Text-completion style prompt (for local providers)."""
         system = self._base_system_prompt(name, voice, traits, mood, patience, facts, context, character_profile, user_profile)
         lines = [system]
 
@@ -379,7 +428,6 @@ class LLM:
             lines.append(f"user: {user_input}")
 
         lines.append(f"{name}:")
-
         return "\n".join(lines)
 
     def build_messages(
@@ -396,13 +444,12 @@ class LLM:
         character_profile: dict = None,
         user_profile: dict = None,
     ) -> list:
+        """Chat-completion style messages (for OpenAI-compatible providers)."""
         system = self._base_system_prompt(name, voice, traits, mood, patience, facts, context, character_profile, user_profile)
 
         messages = [{"role": "system", "content": system}]
-
         for r in recent[-10:]:
             role = "user" if r["role"] == "user" else "assistant"
             messages.append({"role": role, "content": r["message"]})
-
         messages.append({"role": "user", "content": user_input if user_input else "say something"})
         return messages

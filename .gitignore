@@ -5,3 +5,10 @@ __pycache__/
 *.pyo
 .DS_Store
 memory/
+
+# Mira's personality/persona config — keep local, don't track in git
+config.json
+
+# Pi agent runtime data (private: auth, sessions, locks) — the pi integration
+# code itself lives in brain/pi.py and IS committed.
+pi/
